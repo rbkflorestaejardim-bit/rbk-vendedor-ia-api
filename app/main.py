@@ -8,16 +8,23 @@ from typing import Any, Literal
 from uuid import UUID
 
 import psycopg
-from fastapi import Depends, FastAPI, HTTPException, Query, Security, status as http_status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security, status as http_status
 from fastapi.security import APIKeyHeader
 from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, Field, field_validator, model_validator
+from twilio.base.exceptions import TwilioRestException
+from twilio.request_validator import RequestValidator
+from twilio.rest import Client as TwilioClient
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 API_KEY = os.getenv("API_KEY", "").strip()
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "").strip()
+TWILIO_BASE_URL = os.getenv("TWILIO_BASE_URL", "").strip().rstrip("/")
 
 api_key_header = APIKeyHeader(
     name="X-API-Key",
@@ -45,6 +52,18 @@ STATUS_CHAMADA = {
 }
 
 FUSO_PROJETO = ZoneInfo("America/Sao_Paulo")
+
+STATUS_TWILIO_PARA_INTERNO = {
+    "queued": "iniciada",
+    "initiated": "iniciada",
+    "ringing": "em_andamento",
+    "in-progress": "em_andamento",
+    "completed": "concluida",
+    "busy": "ocupado",
+    "failed": "falha",
+    "no-answer": "nao_atendida",
+    "canceled": "cancelada",
+}
 
 
 def obter_conexao():
@@ -209,6 +228,51 @@ def obter_chamada_detalhada(cursor, chamada_id: UUID) -> dict[str, Any]:
         )
 
     return chamada
+
+
+def validar_numero_e164(numero: str) -> str:
+    numero_normalizado = numero.strip()
+
+    if not re.fullmatch(r"\+[1-9]\d{7,14}", numero_normalizado):
+        raise ValueError(
+            "Use o número no formato internacional E.164, por exemplo +5541999999999."
+        )
+
+    return numero_normalizado
+
+
+def mascarar_telefone(numero: str) -> str:
+    if len(numero) <= 6:
+        return "***"
+    return f"{numero[:4]}{'*' * max(len(numero) - 8, 3)}{numero[-4:]}"
+
+
+def obter_cliente_twilio() -> TwilioClient:
+    return TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+
+async def validar_webhook_twilio(request: Request) -> dict[str, str]:
+    assinatura = request.headers.get("X-Twilio-Signature", "")
+    formulario = await request.form()
+    dados = {str(chave): str(valor) for chave, valor in formulario.multi_items()}
+
+    url_assinada = f"{TWILIO_BASE_URL}{request.url.path}"
+    if request.url.query:
+        url_assinada = f"{url_assinada}?{request.url.query}"
+
+    validador = RequestValidator(TWILIO_AUTH_TOKEN)
+
+    if not assinatura or not validador.validate(
+        url_assinada,
+        dados,
+        assinatura,
+    ):
+        raise HTTPException(
+            status_code=http_status.HTTP_403_FORBIDDEN,
+            detail="Assinatura do webhook Twilio inválida.",
+        )
+
+    return dados
 
 
 class ClienteCriar(BaseModel):
@@ -388,6 +452,19 @@ class ChamadaFinalizar(BaseModel):
         return self
 
 
+class TwilioTesteChamada(BaseModel):
+    numero_destino: str = Field(
+        description="Número verificado na Twilio, no padrão E.164.",
+        examples=["+5541999999999"],
+    )
+    timeout_segundos: int = Field(default=25, ge=10, le=60)
+
+    @field_validator("numero_destino")
+    @classmethod
+    def validar_destino(cls, valor: str) -> str:
+        return validar_numero_e164(valor)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not DATABASE_URL:
@@ -395,6 +472,34 @@ async def lifespan(app: FastAPI):
 
     if not API_KEY:
         raise RuntimeError("A variável API_KEY não foi configurada.")
+
+    variaveis_twilio = {
+        "TWILIO_ACCOUNT_SID": TWILIO_ACCOUNT_SID,
+        "TWILIO_AUTH_TOKEN": TWILIO_AUTH_TOKEN,
+        "TWILIO_PHONE_NUMBER": TWILIO_PHONE_NUMBER,
+        "TWILIO_BASE_URL": TWILIO_BASE_URL,
+    }
+    ausentes = [
+        nome
+        for nome, valor in variaveis_twilio.items()
+        if not valor
+    ]
+
+    if ausentes:
+        raise RuntimeError(
+            "Variáveis Twilio não configuradas: " + ", ".join(ausentes)
+        )
+
+    if not TWILIO_ACCOUNT_SID.startswith("AC"):
+        raise RuntimeError("TWILIO_ACCOUNT_SID inválido.")
+
+    try:
+        validar_numero_e164(TWILIO_PHONE_NUMBER)
+    except ValueError as erro:
+        raise RuntimeError("TWILIO_PHONE_NUMBER inválido.") from erro
+
+    if not TWILIO_BASE_URL.startswith("https://"):
+        raise RuntimeError("TWILIO_BASE_URL deve usar HTTPS.")
 
     with obter_conexao() as conexao:
         with conexao.cursor() as cursor:
@@ -439,7 +544,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RBK Vendedor IA API",
     description="API comercial do projeto piloto RBK Vendedor IA.",
-    version="0.4.0",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
@@ -450,7 +555,7 @@ def saude() -> dict[str, str]:
         "status": "ok",
         "servico": "api-comercial",
         "projeto": "RBK Vendedor IA",
-        "versao": "0.4.0",
+        "versao": "0.5.0",
     }
 
 
@@ -1702,3 +1807,265 @@ def finalizar_chamada(
 
         conexao.commit()
         return chamada_finalizada
+
+
+@app.post(
+    "/telefonia/twilio/teste",
+    tags=["Telefonia Twilio"],
+    status_code=http_status.HTTP_201_CREATED,
+    dependencies=[Depends(validar_api_key)],
+)
+def iniciar_teste_twilio(
+    dados: TwilioTesteChamada,
+) -> dict[str, Any]:
+    template_trial = (
+        "https://webhooks.twilio.com/v1/Voice/Template/"
+        "voice_text_to_speech"
+    )
+    callback_url = f"{TWILIO_BASE_URL}/webhooks/twilio/status-chamada"
+    telefone_mascarado = mascarar_telefone(dados.numero_destino)
+
+    try:
+        chamada = obter_cliente_twilio().calls.create(
+            to=dados.numero_destino,
+            from_=TWILIO_PHONE_NUMBER,
+            url=template_trial,
+            method="POST",
+            status_callback=callback_url,
+            status_callback_event=[
+                "initiated",
+                "ringing",
+                "answered",
+                "completed",
+            ],
+            status_callback_method="POST",
+            timeout=dados.timeout_segundos,
+        )
+    except TwilioRestException as erro:
+        with obter_conexao() as conexao:
+            with conexao.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO comercial.acoes_agente (
+                        tipo_acao,
+                        origem,
+                        entrada,
+                        saida,
+                        sucesso,
+                        erro
+                    )
+                    VALUES (
+                        'twilio_teste_chamada',
+                        'api_comercial',
+                        %s,
+                        %s,
+                        FALSE,
+                        %s
+                    );
+                    """,
+                    (
+                        Jsonb(
+                            {
+                                "numero_destino": telefone_mascarado,
+                                "timeout_segundos": dados.timeout_segundos,
+                                "template": "voice_text_to_speech",
+                            }
+                        ),
+                        Jsonb(
+                            {
+                                "codigo_twilio": erro.code,
+                                "status_http": erro.status,
+                            }
+                        ),
+                        str(erro),
+                    ),
+                )
+            conexao.commit()
+
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "mensagem": "A Twilio recusou a criação da chamada.",
+                "codigo_twilio": erro.code,
+                "status_http": erro.status,
+                "detalhe_twilio": erro.msg,
+            },
+        ) from erro
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso
+                )
+                VALUES (
+                    'twilio_teste_chamada',
+                    'api_comercial',
+                    %s,
+                    %s,
+                    TRUE
+                );
+                """,
+                (
+                    Jsonb(
+                        {
+                            "numero_destino": telefone_mascarado,
+                            "timeout_segundos": dados.timeout_segundos,
+                            "template": "voice_text_to_speech",
+                        }
+                    ),
+                    Jsonb(
+                        {
+                            "call_sid": chamada.sid,
+                            "status": chamada.status,
+                            "numero_origem": TWILIO_PHONE_NUMBER,
+                        }
+                    ),
+                ),
+            )
+        conexao.commit()
+
+    return {
+        "mensagem": "Chamada de teste solicitada à Twilio.",
+        "call_sid": chamada.sid,
+        "status": chamada.status,
+        "numero_origem": TWILIO_PHONE_NUMBER,
+        "numero_destino": telefone_mascarado,
+        "template_trial": "voice_text_to_speech",
+        "status_callback": callback_url,
+    }
+
+
+@app.get(
+    "/telefonia/twilio/chamadas/{call_sid}",
+    tags=["Telefonia Twilio"],
+    dependencies=[Depends(validar_api_key)],
+)
+def consultar_chamada_twilio(
+    call_sid: str,
+) -> dict[str, Any]:
+    if not re.fullmatch(r"CA[0-9a-fA-F]{32}", call_sid):
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Call SID da Twilio inválido.",
+        )
+
+    try:
+        chamada = obter_cliente_twilio().calls(call_sid).fetch()
+    except TwilioRestException as erro:
+        codigo_http = (
+            http_status.HTTP_404_NOT_FOUND
+            if erro.status == 404
+            else http_status.HTTP_502_BAD_GATEWAY
+        )
+        raise HTTPException(
+            status_code=codigo_http,
+            detail={
+                "mensagem": "Não foi possível consultar a chamada na Twilio.",
+                "codigo_twilio": erro.code,
+                "status_http": erro.status,
+                "detalhe_twilio": erro.msg,
+            },
+        ) from erro
+
+    return {
+        "call_sid": chamada.sid,
+        "status": chamada.status,
+        "direcao": chamada.direction,
+        "numero_origem": chamada.from_,
+        "numero_destino": mascarar_telefone(chamada.to),
+        "duracao_segundos": chamada.duration,
+        "preco": chamada.price,
+        "moeda": chamada.price_unit,
+        "inicio_em": chamada.start_time,
+        "fim_em": chamada.end_time,
+    }
+
+
+@app.post(
+    "/webhooks/twilio/status-chamada",
+    include_in_schema=False,
+)
+async def receber_status_chamada_twilio(
+    request: Request,
+) -> dict[str, str]:
+    dados = await validar_webhook_twilio(request)
+
+    call_sid = dados.get("CallSid")
+    status_twilio = dados.get("CallStatus", "")
+    status_interno = STATUS_TWILIO_PARA_INTERNO.get(status_twilio)
+    duracao = dados.get("CallDuration")
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso
+                )
+                VALUES (
+                    'twilio_status_chamada',
+                    'twilio_webhook',
+                    %s,
+                    %s,
+                    TRUE
+                );
+                """,
+                (
+                    Jsonb(dados),
+                    Jsonb(
+                        {
+                            "call_sid": call_sid,
+                            "status_twilio": status_twilio,
+                            "status_interno": status_interno,
+                        }
+                    ),
+                ),
+            )
+
+            if call_sid and status_interno:
+                cursor.execute(
+                    """
+                    UPDATE comercial.chamadas_ia
+                    SET
+                        status = %s,
+                        duracao_segundos = COALESCE(%s, duracao_segundos),
+                        atendida = CASE
+                            WHEN %s IN ('em_andamento', 'concluida') THEN TRUE
+                            ELSE atendida
+                        END,
+                        fim_em = CASE
+                            WHEN %s IN (
+                                'concluida',
+                                'nao_atendida',
+                                'ocupado',
+                                'falha',
+                                'cancelada'
+                            )
+                            THEN COALESCE(fim_em, NOW())
+                            ELSE fim_em
+                        END
+                    WHERE chamada_externa_id = %s;
+                    """,
+                    (
+                        status_interno,
+                        int(duracao) if duracao and duracao.isdigit() else None,
+                        status_interno,
+                        status_interno,
+                        call_sid,
+                    ),
+                )
+
+        conexao.commit()
+
+    return {"status": "recebido"}
+
