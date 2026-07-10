@@ -1,19 +1,49 @@
+import hmac
 import os
 from contextlib import asynccontextmanager
 from typing import Any
 
 import psycopg
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Security, status
+from fastapi.security import APIKeyHeader
 from psycopg.rows import dict_row
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+API_KEY = os.getenv("API_KEY", "").strip()
+
+api_key_header = APIKeyHeader(
+    name="X-API-Key",
+    auto_error=False,
+    description="Chave privada de acesso à API Comercial RBK.",
+)
 
 
 def obter_conexao():
     if not DATABASE_URL:
         raise RuntimeError("A variável DATABASE_URL não foi configurada.")
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+    return psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+        connect_timeout=10,
+    )
+
+
+def validar_api_key(
+    chave_recebida: str | None = Security(api_key_header),
+) -> None:
+    if not API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A API ainda não possui chave de acesso configurada.",
+        )
+
+    if not chave_recebida or not hmac.compare_digest(chave_recebida, API_KEY):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Chave de acesso inválida ou ausente.",
+        )
 
 
 @asynccontextmanager
@@ -21,31 +51,52 @@ async def lifespan(app: FastAPI):
     if not DATABASE_URL:
         raise RuntimeError("A variável DATABASE_URL não foi configurada.")
 
+    if not API_KEY:
+        raise RuntimeError("A variável API_KEY não foi configurada.")
+
     with obter_conexao() as conexao:
         with conexao.cursor() as cursor:
-            cursor.execute("SELECT 1;")
-            cursor.fetchone()
+            cursor.execute(
+                """
+                SELECT
+                    current_database(),
+                    to_regclass('comercial.vendedores_ia'),
+                    to_regclass('comercial.configuracoes');
+                """
+            )
+            banco, vendedores, configuracoes = cursor.fetchone().values()
+
+            if vendedores is None or configuracoes is None:
+                raise RuntimeError(
+                    f"Estrutura comercial não encontrada no banco {banco}."
+                )
 
     yield
 
 
 app = FastAPI(
     title="RBK Vendedor IA API",
-    version="0.1.0",
+    description="API comercial do projeto piloto RBK Vendedor IA.",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
 
-@app.get("/saude")
+@app.get("/saude", tags=["Sistema"])
 def saude() -> dict[str, str]:
     return {
         "status": "ok",
         "servico": "api-comercial",
         "projeto": "RBK Vendedor IA",
+        "versao": "0.2.0",
     }
 
 
-@app.get("/vendedores")
+@app.get(
+    "/vendedores",
+    tags=["Vendedores"],
+    dependencies=[Depends(validar_api_key)],
+)
 def listar_vendedores() -> list[dict[str, Any]]:
     consulta = """
         SELECT
@@ -83,7 +134,11 @@ def listar_vendedores() -> list[dict[str, Any]]:
             return cursor.fetchall()
 
 
-@app.get("/vendedores/{codigo}")
+@app.get(
+    "/vendedores/{codigo}",
+    tags=["Vendedores"],
+    dependencies=[Depends(validar_api_key)],
+)
 def buscar_vendedor(codigo: str) -> dict[str, Any]:
     consulta = """
         SELECT
@@ -122,12 +177,19 @@ def buscar_vendedor(codigo: str) -> dict[str, Any]:
             vendedor = cursor.fetchone()
 
     if vendedor is None:
-        raise HTTPException(status_code=404, detail="Vendedor não encontrado.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Vendedor não encontrado.",
+        )
 
     return vendedor
 
 
-@app.get("/configuracoes/{chave}")
+@app.get(
+    "/configuracoes/{chave}",
+    tags=["Configurações"],
+    dependencies=[Depends(validar_api_key)],
+)
 def buscar_configuracao(chave: str) -> dict[str, Any]:
     consulta = """
         SELECT chave, valor, descricao, atualizado_em
@@ -141,6 +203,9 @@ def buscar_configuracao(chave: str) -> dict[str, Any]:
             configuracao = cursor.fetchone()
 
     if configuracao is None:
-        raise HTTPException(status_code=404, detail="Configuração não encontrada.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Configuração não encontrada.",
+        )
 
     return configuracao

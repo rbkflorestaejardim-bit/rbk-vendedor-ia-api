@@ -1,6 +1,20 @@
 # RBK Vendedor IA API
 
-API inicial do projeto piloto.
+API comercial do projeto piloto.
+
+## Versão
+
+`0.2.0`
+
+## Segurança
+
+Os endpoints comerciais exigem o cabeçalho:
+
+```text
+X-API-Key: SUA_CHAVE
+```
+
+O endpoint `/saude` permanece público.
 
 ## Endpoints
 
@@ -10,6 +24,15 @@ API inicial do projeto piloto.
 - `GET /configuracoes/projeto`
 - `GET /docs`
 
-## Variável obrigatória
+## Variáveis obrigatórias
 
-`DATABASE_URL`
+- `DATABASE_URL`
+- `API_KEY`
+
+## Observação sobre senhas na DATABASE_URL
+
+Caracteres especiais precisam ser codificados. Exemplo:
+
+- `@` vira `%40`
+- `#` vira `%23`
+- `%` vira `%25`
