@@ -8,7 +8,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 import psycopg
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security, status as http_status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, Security, status as http_status
 from fastapi.security import APIKeyHeader
 from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from twilio.base.exceptions import TwilioRestException
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client as TwilioClient
+from twilio.twiml.voice_response import VoiceResponse
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -465,6 +466,19 @@ class TwilioTesteChamada(BaseModel):
         return validar_numero_e164(valor)
 
 
+class TwilioTesteInterativo(BaseModel):
+    numero_destino: str = Field(
+        description="Número verificado na Twilio, no padrão E.164.",
+        examples=["+5541999999999"],
+    )
+    timeout_segundos: int = Field(default=25, ge=10, le=60)
+
+    @field_validator("numero_destino")
+    @classmethod
+    def validar_destino(cls, valor: str) -> str:
+        return validar_numero_e164(valor)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not DATABASE_URL:
@@ -544,7 +558,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RBK Vendedor IA API",
     description="API comercial do projeto piloto RBK Vendedor IA.",
-    version="0.5.0",
+    version="0.6.0",
     lifespan=lifespan,
 )
 
@@ -555,7 +569,7 @@ def saude() -> dict[str, str]:
         "status": "ok",
         "servico": "api-comercial",
         "projeto": "RBK Vendedor IA",
-        "versao": "0.5.0",
+        "versao": "0.6.0",
     }
 
 
@@ -2069,3 +2083,298 @@ async def receber_status_chamada_twilio(
 
     return {"status": "recebido"}
 
+
+@app.post(
+    "/telefonia/twilio/teste-interativo",
+    tags=["Telefonia Twilio"],
+    status_code=http_status.HTTP_201_CREATED,
+    dependencies=[Depends(validar_api_key)],
+)
+def iniciar_teste_interativo_twilio(
+    dados: TwilioTesteInterativo,
+) -> dict[str, Any]:
+    url_voz = f"{TWILIO_BASE_URL}/webhooks/twilio/voz-interativa"
+    callback_url = f"{TWILIO_BASE_URL}/webhooks/twilio/status-chamada"
+    telefone_mascarado = mascarar_telefone(dados.numero_destino)
+
+    try:
+        chamada = obter_cliente_twilio().calls.create(
+            to=dados.numero_destino,
+            from_=TWILIO_PHONE_NUMBER,
+            url=url_voz,
+            method="POST",
+            status_callback=callback_url,
+            status_callback_event=[
+                "initiated",
+                "ringing",
+                "answered",
+                "completed",
+            ],
+            status_callback_method="POST",
+            timeout=dados.timeout_segundos,
+        )
+    except TwilioRestException as erro:
+        with obter_conexao() as conexao:
+            with conexao.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO comercial.acoes_agente (
+                        tipo_acao,
+                        origem,
+                        entrada,
+                        saida,
+                        sucesso,
+                        erro
+                    )
+                    VALUES (
+                        'twilio_teste_interativo',
+                        'api_comercial',
+                        %s,
+                        %s,
+                        FALSE,
+                        %s
+                    );
+                    """,
+                    (
+                        Jsonb(
+                            {
+                                "numero_destino": telefone_mascarado,
+                                "timeout_segundos": dados.timeout_segundos,
+                            }
+                        ),
+                        Jsonb(
+                            {
+                                "codigo_twilio": erro.code,
+                                "status_http": erro.status,
+                            }
+                        ),
+                        str(erro),
+                    ),
+                )
+            conexao.commit()
+
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "mensagem": "A Twilio recusou o teste interativo.",
+                "codigo_twilio": erro.code,
+                "status_http": erro.status,
+                "detalhe_twilio": erro.msg,
+            },
+        ) from erro
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso
+                )
+                VALUES (
+                    'twilio_teste_interativo',
+                    'api_comercial',
+                    %s,
+                    %s,
+                    TRUE
+                );
+                """,
+                (
+                    Jsonb(
+                        {
+                            "numero_destino": telefone_mascarado,
+                            "timeout_segundos": dados.timeout_segundos,
+                        }
+                    ),
+                    Jsonb(
+                        {
+                            "call_sid": chamada.sid,
+                            "status": chamada.status,
+                            "url_voz": url_voz,
+                        }
+                    ),
+                ),
+            )
+        conexao.commit()
+
+    return {
+        "mensagem": "Teste interativo solicitado à Twilio.",
+        "call_sid": chamada.sid,
+        "status": chamada.status,
+        "numero_origem": TWILIO_PHONE_NUMBER,
+        "numero_destino": telefone_mascarado,
+        "url_voz": url_voz,
+        "status_callback": callback_url,
+    }
+
+
+@app.post(
+    "/webhooks/twilio/voz-interativa",
+    include_in_schema=False,
+)
+async def fornecer_voz_interativa_twilio(
+    request: Request,
+):
+    await validar_webhook_twilio(request)
+
+    resposta = VoiceResponse()
+    coleta = resposta.gather(
+        input="speech",
+        action=f"{TWILIO_BASE_URL}/webhooks/twilio/resposta-interativa",
+        method="POST",
+        language="pt-BR",
+        speech_timeout="auto",
+        timeout=5,
+        action_on_empty_result=True,
+    )
+    coleta.say(
+        (
+            "Olá. Aqui é o Carlos, assistente virtual da RBK Distribuidora. "
+            "Esta é uma ligação de teste. "
+            "Depois do sinal, diga seu nome e uma peça que gostaria de consultar."
+        ),
+        language="pt-BR",
+    )
+    resposta.say(
+        "Não consegui receber sua resposta. O teste será encerrado.",
+        language="pt-BR",
+    )
+    resposta.hangup()
+
+    return Response(
+        content=str(resposta),
+        media_type="application/xml",
+    )
+
+
+@app.post(
+    "/webhooks/twilio/resposta-interativa",
+    include_in_schema=False,
+)
+async def receber_resposta_interativa_twilio(
+    request: Request,
+):
+    dados = await validar_webhook_twilio(request)
+
+    call_sid = dados.get("CallSid")
+    fala = (dados.get("SpeechResult") or "").strip()
+    confianca = dados.get("Confidence")
+
+    if len(fala) > 500:
+        fala = fala[:500]
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso
+                )
+                VALUES (
+                    'twilio_resposta_interativa',
+                    'twilio_webhook',
+                    %s,
+                    %s,
+                    TRUE
+                );
+                """,
+                (
+                    Jsonb(
+                        {
+                            "CallSid": call_sid,
+                            "SpeechResult": fala,
+                            "Confidence": confianca,
+                        }
+                    ),
+                    Jsonb(
+                        {
+                            "fala_recebida": bool(fala),
+                            "tamanho": len(fala),
+                        }
+                    ),
+                ),
+            )
+        conexao.commit()
+
+    resposta = VoiceResponse()
+
+    if fala:
+        resposta.say(
+            (
+                "Entendi sua resposta. "
+                "O reconhecimento de voz do projeto foi validado com sucesso. "
+                "Obrigado."
+            ),
+            language="pt-BR",
+        )
+    else:
+        resposta.say(
+            (
+                "Não consegui entender sua resposta. "
+                "O teste de telefonia foi concluído, mas o reconhecimento "
+                "de voz precisa ser repetido."
+            ),
+            language="pt-BR",
+        )
+
+    resposta.hangup()
+
+    return Response(
+        content=str(resposta),
+        media_type="application/xml",
+    )
+
+
+@app.get(
+    "/telefonia/twilio/teste-interativo/{call_sid}",
+    tags=["Telefonia Twilio"],
+    dependencies=[Depends(validar_api_key)],
+)
+def consultar_teste_interativo_twilio(
+    call_sid: str,
+) -> dict[str, Any]:
+    if not re.fullmatch(r"CA[0-9a-fA-F]{32}", call_sid):
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Call SID da Twilio inválido.",
+        )
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    entrada,
+                    saida,
+                    criado_em
+                FROM comercial.acoes_agente
+                WHERE tipo_acao = 'twilio_resposta_interativa'
+                  AND entrada ->> 'CallSid' = %s
+                ORDER BY criado_em DESC
+                LIMIT 1;
+                """,
+                (call_sid,),
+            )
+            resultado = cursor.fetchone()
+
+    if resultado is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Ainda não existe resposta reconhecida para esta chamada.",
+        )
+
+    return {
+        "call_sid": call_sid,
+        "fala_reconhecida": resultado["entrada"].get("SpeechResult"),
+        "confianca": resultado["entrada"].get("Confidence"),
+        "fala_recebida": resultado["saida"].get("fala_recebida"),
+        "registrado_em": resultado["criado_em"],
+    }
