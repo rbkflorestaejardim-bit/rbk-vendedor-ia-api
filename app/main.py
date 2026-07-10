@@ -59,14 +59,23 @@ async def lifespan(app: FastAPI):
             cursor.execute(
                 """
                 SELECT
-                    current_database(),
-                    to_regclass('comercial.vendedores_ia'),
-                    to_regclass('comercial.configuracoes');
+                    current_database() AS banco,
+                    to_regclass('comercial.vendedores_ia') AS tabela_vendedores,
+                    to_regclass('comercial.configuracoes') AS tabela_configuracoes;
                 """
             )
-            banco, vendedores, configuracoes = cursor.fetchone().values()
+            resultado = cursor.fetchone()
 
-            if vendedores is None or configuracoes is None:
+            if resultado is None:
+                raise RuntimeError(
+                    "Não foi possível validar a estrutura do banco de dados."
+                )
+
+            banco = resultado["banco"]
+            tabela_vendedores = resultado["tabela_vendedores"]
+            tabela_configuracoes = resultado["tabela_configuracoes"]
+
+            if tabela_vendedores is None or tabela_configuracoes is None:
                 raise RuntimeError(
                     f"Estrutura comercial não encontrada no banco {banco}."
                 )
@@ -77,7 +86,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RBK Vendedor IA API",
     description="API comercial do projeto piloto RBK Vendedor IA.",
-    version="0.2.0",
+    version="0.2.1",
     lifespan=lifespan,
 )
 
@@ -88,7 +97,7 @@ def saude() -> dict[str, str]:
         "status": "ok",
         "servico": "api-comercial",
         "projeto": "RBK Vendedor IA",
-        "versao": "0.2.0",
+        "versao": "0.2.1",
     }
 
 
