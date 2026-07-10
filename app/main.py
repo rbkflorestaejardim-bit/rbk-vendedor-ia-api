@@ -3,6 +3,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time
+from zoneinfo import ZoneInfo
 from typing import Any, Literal
 from uuid import UUID
 
@@ -32,6 +33,18 @@ STATUS_AGENDA = {
     "cancelada",
     "sem_resposta",
 }
+
+STATUS_CHAMADA = {
+    "iniciada",
+    "em_andamento",
+    "concluida",
+    "nao_atendida",
+    "ocupado",
+    "falha",
+    "cancelada",
+}
+
+FUSO_PROJETO = ZoneInfo("America/Sao_Paulo")
 
 
 def obter_conexao():
@@ -117,6 +130,85 @@ def obter_cliente_por_id(cursor, cliente_id: UUID) -> dict[str, Any]:
         )
 
     return cliente
+
+
+def obter_agenda_detalhada(cursor, agenda_id: UUID) -> dict[str, Any]:
+    cursor.execute(
+        """
+        SELECT
+            a.*,
+            c.cpf_cnpj,
+            c.razao_social,
+            c.nome_fantasia,
+            c.nome_contato,
+            c.telefone,
+            c.whatsapp,
+            c.email,
+            c.cidade,
+            c.uf,
+            c.status AS cliente_status,
+            c.opt_out,
+            c.bloqueado,
+            c.dados_adicionais,
+            v.codigo AS vendedor_codigo,
+            v.nome_exibicao AS vendedor_nome
+        FROM comercial.agendas_comerciais a
+        JOIN comercial.clientes c
+            ON c.id = a.cliente_id
+        JOIN comercial.vendedores_ia v
+            ON v.id = a.vendedor_id
+        WHERE a.id = %s;
+        """,
+        (agenda_id,),
+    )
+    agenda = cursor.fetchone()
+
+    if agenda is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Agenda não encontrada.",
+        )
+
+    return agenda
+
+
+def obter_chamada_detalhada(cursor, chamada_id: UUID) -> dict[str, Any]:
+    cursor.execute(
+        """
+        SELECT
+            ch.*,
+            a.data_agenda,
+            a.status AS agenda_status,
+            c.cpf_cnpj,
+            c.razao_social,
+            c.nome_fantasia,
+            c.nome_contato,
+            c.telefone,
+            c.whatsapp,
+            c.cidade,
+            c.uf,
+            v.codigo AS vendedor_codigo,
+            v.nome_exibicao AS vendedor_nome
+        FROM comercial.chamadas_ia ch
+        LEFT JOIN comercial.agendas_comerciais a
+            ON a.id = ch.agenda_id
+        JOIN comercial.clientes c
+            ON c.id = ch.cliente_id
+        JOIN comercial.vendedores_ia v
+            ON v.id = ch.vendedor_id
+        WHERE ch.id = %s;
+        """,
+        (chamada_id,),
+    )
+    chamada = cursor.fetchone()
+
+    if chamada is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Chamada não encontrada.",
+        )
+
+    return chamada
 
 
 class ClienteCriar(BaseModel):
@@ -237,6 +329,65 @@ class AgendaAtualizar(BaseModel):
     observacao: str | None = None
 
 
+class AssumirProximaAgenda(BaseModel):
+    vendedor_codigo: str = Field(max_length=40)
+    data_agenda: date | None = None
+
+    @field_validator("vendedor_codigo")
+    @classmethod
+    def validar_codigo_vendedor(cls, valor: str) -> str:
+        return valor.upper()
+
+
+class ChamadaIniciar(BaseModel):
+    agenda_id: UUID
+    provedor: str = Field(max_length=60)
+    chamada_externa_id: str | None = Field(default=None, max_length=150)
+    numero_origem: str | None = Field(default=None, max_length=30)
+    numero_destino: str | None = Field(default=None, max_length=30)
+    status: Literal["iniciada", "em_andamento"] = "iniciada"
+
+
+class ChamadaFinalizar(BaseModel):
+    status: Literal[
+        "concluida",
+        "nao_atendida",
+        "ocupado",
+        "falha",
+        "cancelada",
+    ]
+    atendida: bool = False
+    fim_em: datetime | None = None
+    duracao_segundos: int | None = Field(default=None, ge=0)
+    gravacao_url: str | None = None
+    transcricao: str | None = None
+    resumo: str | None = None
+    sentimento: str | None = Field(default=None, max_length=40)
+    intencao: str | None = Field(default=None, max_length=80)
+    resultado: str | None = Field(default=None, max_length=80)
+    custo_telefonia: float = Field(default=0, ge=0)
+    custo_ia: float = Field(default=0, ge=0)
+    dados_extraidos: dict[str, Any] = Field(default_factory=dict)
+    agenda_status: Literal[
+        "concluida",
+        "reagendada",
+        "cancelada",
+        "sem_resposta",
+    ]
+    proxima_tentativa_em: datetime | None = None
+    observacao_agenda: str | None = None
+    cliente_status: str | None = Field(default=None, max_length=40)
+    proxima_acao_em: datetime | None = None
+
+    @model_validator(mode="after")
+    def validar_reagendamento(self):
+        if self.agenda_status == "reagendada" and self.proxima_tentativa_em is None:
+            raise ValueError(
+                "Informe proxima_tentativa_em quando a agenda for reagendada."
+            )
+        return self
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not DATABASE_URL:
@@ -254,6 +405,9 @@ async def lifespan(app: FastAPI):
                     to_regclass('comercial.vendedores_ia') AS tabela_vendedores,
                     to_regclass('comercial.clientes') AS tabela_clientes,
                     to_regclass('comercial.agendas_comerciais') AS tabela_agendas,
+                    to_regclass('comercial.chamadas_ia') AS tabela_chamadas,
+                    to_regclass('comercial.interacoes') AS tabela_interacoes,
+                    to_regclass('comercial.acoes_agente') AS tabela_acoes,
                     to_regclass('comercial.configuracoes') AS tabela_configuracoes;
                 """
             )
@@ -268,6 +422,9 @@ async def lifespan(app: FastAPI):
                 resultado["tabela_vendedores"],
                 resultado["tabela_clientes"],
                 resultado["tabela_agendas"],
+                resultado["tabela_chamadas"],
+                resultado["tabela_interacoes"],
+                resultado["tabela_acoes"],
                 resultado["tabela_configuracoes"],
             ]
 
@@ -282,7 +439,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RBK Vendedor IA API",
     description="API comercial do projeto piloto RBK Vendedor IA.",
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -293,7 +450,7 @@ def saude() -> dict[str, str]:
         "status": "ok",
         "servico": "api-comercial",
         "projeto": "RBK Vendedor IA",
-        "versao": "0.3.0",
+        "versao": "0.4.0",
     }
 
 
@@ -731,7 +888,7 @@ def buscar_proxima_agenda(
     vendedor_codigo: str,
     data_agenda: date | None = None,
 ) -> dict[str, Any]:
-    data_consulta = data_agenda or date.today()
+    data_consulta = data_agenda or datetime.now(FUSO_PROJETO).date()
 
     with obter_conexao() as conexao:
         with conexao.cursor() as cursor:
@@ -947,3 +1104,601 @@ def atualizar_agenda(
 
         conexao.commit()
         return agenda
+
+
+@app.post(
+    "/agendas/assumir-proxima",
+    tags=["Agenda"],
+    dependencies=[Depends(validar_api_key)],
+)
+def assumir_proxima_agenda(
+    dados: AssumirProximaAgenda,
+) -> dict[str, Any]:
+    data_consulta = dados.data_agenda or datetime.now(FUSO_PROJETO).date()
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            vendedor = obter_vendedor_por_codigo(
+                cursor,
+                dados.vendedor_codigo,
+            )
+
+            cursor.execute(
+                """
+                SELECT a.id
+                FROM comercial.agendas_comerciais a
+                JOIN comercial.clientes c
+                    ON c.id = a.cliente_id
+                WHERE a.vendedor_id = %s
+                  AND a.data_agenda = %s
+                  AND a.status = 'pendente'
+                  AND a.numero_tentativas < a.maximo_tentativas
+                  AND c.bloqueado = FALSE
+                  AND c.opt_out = FALSE
+                ORDER BY
+                    a.prioridade ASC,
+                    a.horario_previsto NULLS LAST,
+                    a.criado_em ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1;
+                """,
+                (vendedor["id"], data_consulta),
+            )
+            selecionada = cursor.fetchone()
+
+            if selecionada is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail=(
+                        "Nenhuma agenda pendente disponível para o vendedor "
+                        "e data informados."
+                    ),
+                )
+
+            agenda_id = selecionada["id"]
+
+            cursor.execute(
+                """
+                UPDATE comercial.agendas_comerciais
+                SET
+                    status = 'em_execucao',
+                    numero_tentativas = numero_tentativas + 1,
+                    ultima_tentativa_em = NOW(),
+                    atualizado_em = NOW()
+                WHERE id = %s;
+                """,
+                (agenda_id,),
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    vendedor_id,
+                    cliente_id,
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso
+                )
+                SELECT
+                    a.vendedor_id,
+                    a.cliente_id,
+                    'assumir_agenda',
+                    'api_comercial',
+                    %s,
+                    %s,
+                    TRUE
+                FROM comercial.agendas_comerciais a
+                WHERE a.id = %s;
+                """,
+                (
+                    Jsonb(
+                        {
+                            "vendedor_codigo": dados.vendedor_codigo,
+                            "data_agenda": data_consulta.isoformat(),
+                        }
+                    ),
+                    Jsonb(
+                        {
+                            "agenda_id": str(agenda_id),
+                            "status": "em_execucao",
+                        }
+                    ),
+                    agenda_id,
+                ),
+            )
+
+            agenda = obter_agenda_detalhada(cursor, agenda_id)
+
+        conexao.commit()
+        return agenda
+
+
+@app.post(
+    "/agendas/{agenda_id}/liberar",
+    tags=["Agenda"],
+    dependencies=[Depends(validar_api_key)],
+)
+def liberar_agenda(
+    agenda_id: UUID,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            agenda = obter_agenda_detalhada(cursor, agenda_id)
+
+            if agenda["status"] != "em_execucao":
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail="Somente agendas em execução podem ser liberadas.",
+                )
+
+            cursor.execute(
+                """
+                UPDATE comercial.agendas_comerciais
+                SET
+                    status = 'pendente',
+                    atualizado_em = NOW()
+                WHERE id = %s;
+                """,
+                (agenda_id,),
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    vendedor_id,
+                    cliente_id,
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'liberar_agenda',
+                    'api_comercial',
+                    %s,
+                    %s,
+                    TRUE
+                );
+                """,
+                (
+                    agenda["vendedor_id"],
+                    agenda["cliente_id"],
+                    Jsonb({"agenda_id": str(agenda_id)}),
+                    Jsonb({"status": "pendente"}),
+                ),
+            )
+
+            agenda_atualizada = obter_agenda_detalhada(cursor, agenda_id)
+
+        conexao.commit()
+        return agenda_atualizada
+
+
+@app.post(
+    "/chamadas",
+    tags=["Chamadas"],
+    status_code=http_status.HTTP_201_CREATED,
+    dependencies=[Depends(validar_api_key)],
+)
+def iniciar_chamada(
+    dados: ChamadaIniciar,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            agenda = obter_agenda_detalhada(cursor, dados.agenda_id)
+
+            if agenda["status"] != "em_execucao":
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail=(
+                        "A agenda precisa estar em execução antes de iniciar "
+                        "a chamada."
+                    ),
+                )
+
+            numero_destino = dados.numero_destino or agenda["telefone"]
+
+            if not numero_destino:
+                raise HTTPException(
+                    status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="O cliente não possui telefone para a chamada.",
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.chamadas_ia (
+                    agenda_id,
+                    cliente_id,
+                    vendedor_id,
+                    provedor,
+                    chamada_externa_id,
+                    numero_origem,
+                    numero_destino,
+                    direcao,
+                    status,
+                    inicio_em
+                )
+                VALUES (
+                    %(agenda_id)s,
+                    %(cliente_id)s,
+                    %(vendedor_id)s,
+                    %(provedor)s,
+                    %(chamada_externa_id)s,
+                    %(numero_origem)s,
+                    %(numero_destino)s,
+                    'saida',
+                    %(status)s,
+                    NOW()
+                )
+                RETURNING id;
+                """,
+                {
+                    "agenda_id": dados.agenda_id,
+                    "cliente_id": agenda["cliente_id"],
+                    "vendedor_id": agenda["vendedor_id"],
+                    "provedor": dados.provedor,
+                    "chamada_externa_id": dados.chamada_externa_id,
+                    "numero_origem": dados.numero_origem,
+                    "numero_destino": numero_destino,
+                    "status": dados.status,
+                },
+            )
+            chamada_id = cursor.fetchone()["id"]
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    vendedor_id,
+                    cliente_id,
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'iniciar_chamada',
+                    'api_comercial',
+                    %s,
+                    %s,
+                    TRUE
+                );
+                """,
+                (
+                    agenda["vendedor_id"],
+                    agenda["cliente_id"],
+                    Jsonb(
+                        {
+                            "agenda_id": str(dados.agenda_id),
+                            "provedor": dados.provedor,
+                            "numero_destino": numero_destino,
+                        }
+                    ),
+                    Jsonb({"chamada_id": str(chamada_id)}),
+                ),
+            )
+
+            chamada = obter_chamada_detalhada(cursor, chamada_id)
+
+        conexao.commit()
+        return chamada
+
+
+@app.get(
+    "/chamadas",
+    tags=["Chamadas"],
+    dependencies=[Depends(validar_api_key)],
+)
+def listar_chamadas(
+    vendedor_codigo: str | None = None,
+    cliente_id: UUID | None = None,
+    status_chamada: str | None = Query(default=None, alias="status"),
+    data_inicio: date | None = None,
+    data_fim: date | None = None,
+    limite: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    if status_chamada and status_chamada not in STATUS_CHAMADA:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Status inválido. Use um destes: {', '.join(sorted(STATUS_CHAMADA))}.",
+        )
+
+    filtros: list[str] = []
+    parametros: list[Any] = []
+
+    if vendedor_codigo:
+        filtros.append("v.codigo = %s")
+        parametros.append(vendedor_codigo.upper())
+
+    if cliente_id:
+        filtros.append("ch.cliente_id = %s")
+        parametros.append(cliente_id)
+
+    if status_chamada:
+        filtros.append("ch.status = %s")
+        parametros.append(status_chamada)
+
+    if data_inicio:
+        filtros.append("ch.criado_em::date >= %s")
+        parametros.append(data_inicio)
+
+    if data_fim:
+        filtros.append("ch.criado_em::date <= %s")
+        parametros.append(data_fim)
+
+    where_sql = f"WHERE {' AND '.join(filtros)}" if filtros else ""
+
+    consulta_total = f"""
+        SELECT COUNT(*) AS total
+        FROM comercial.chamadas_ia ch
+        JOIN comercial.vendedores_ia v
+            ON v.id = ch.vendedor_id
+        {where_sql};
+    """
+
+    consulta_itens = f"""
+        SELECT
+            ch.*,
+            a.data_agenda,
+            a.status AS agenda_status,
+            c.razao_social,
+            c.nome_fantasia,
+            c.nome_contato,
+            c.telefone,
+            c.cidade,
+            c.uf,
+            v.codigo AS vendedor_codigo,
+            v.nome_exibicao AS vendedor_nome
+        FROM comercial.chamadas_ia ch
+        LEFT JOIN comercial.agendas_comerciais a
+            ON a.id = ch.agenda_id
+        JOIN comercial.clientes c
+            ON c.id = ch.cliente_id
+        JOIN comercial.vendedores_ia v
+            ON v.id = ch.vendedor_id
+        {where_sql}
+        ORDER BY ch.criado_em DESC
+        LIMIT %s OFFSET %s;
+    """
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(consulta_total, parametros)
+            total = cursor.fetchone()["total"]
+
+            cursor.execute(
+                consulta_itens,
+                [*parametros, limite, offset],
+            )
+            itens = cursor.fetchall()
+
+    return {
+        "total": total,
+        "limite": limite,
+        "offset": offset,
+        "itens": itens,
+    }
+
+
+@app.get(
+    "/chamadas/{chamada_id}",
+    tags=["Chamadas"],
+    dependencies=[Depends(validar_api_key)],
+)
+def buscar_chamada(
+    chamada_id: UUID,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            return obter_chamada_detalhada(cursor, chamada_id)
+
+
+@app.patch(
+    "/chamadas/{chamada_id}/finalizar",
+    tags=["Chamadas"],
+    dependencies=[Depends(validar_api_key)],
+)
+def finalizar_chamada(
+    chamada_id: UUID,
+    dados: ChamadaFinalizar,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            chamada = obter_chamada_detalhada(cursor, chamada_id)
+
+            if chamada["status"] in {
+                "concluida",
+                "nao_atendida",
+                "ocupado",
+                "falha",
+                "cancelada",
+            }:
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail="Esta chamada já foi finalizada.",
+                )
+
+            fim_em = dados.fim_em or datetime.now(FUSO_PROJETO)
+            custo_total = round(dados.custo_telefonia + dados.custo_ia, 4)
+
+            cursor.execute(
+                """
+                UPDATE comercial.chamadas_ia
+                SET
+                    status = %(status)s,
+                    atendida = %(atendida)s,
+                    fim_em = %(fim_em)s,
+                    duracao_segundos = %(duracao_segundos)s,
+                    gravacao_url = %(gravacao_url)s,
+                    transcricao = %(transcricao)s,
+                    resumo = %(resumo)s,
+                    sentimento = %(sentimento)s,
+                    intencao = %(intencao)s,
+                    resultado = %(resultado)s,
+                    custo_telefonia = %(custo_telefonia)s,
+                    custo_ia = %(custo_ia)s,
+                    custo_total = %(custo_total)s,
+                    dados_extraidos = %(dados_extraidos)s
+                WHERE id = %(chamada_id)s;
+                """,
+                {
+                    "status": dados.status,
+                    "atendida": dados.atendida,
+                    "fim_em": fim_em,
+                    "duracao_segundos": dados.duracao_segundos,
+                    "gravacao_url": dados.gravacao_url,
+                    "transcricao": dados.transcricao,
+                    "resumo": dados.resumo,
+                    "sentimento": dados.sentimento,
+                    "intencao": dados.intencao,
+                    "resultado": dados.resultado,
+                    "custo_telefonia": dados.custo_telefonia,
+                    "custo_ia": dados.custo_ia,
+                    "custo_total": custo_total,
+                    "dados_extraidos": Jsonb(dados.dados_extraidos),
+                    "chamada_id": chamada_id,
+                },
+            )
+
+            cursor.execute(
+                """
+                UPDATE comercial.agendas_comerciais
+                SET
+                    status = %s,
+                    resultado = %s,
+                    proxima_tentativa_em = %s,
+                    observacao = COALESCE(%s, observacao),
+                    atualizado_em = NOW()
+                WHERE id = %s;
+                """,
+                (
+                    dados.agenda_status,
+                    dados.resultado,
+                    dados.proxima_tentativa_em,
+                    dados.observacao_agenda,
+                    chamada["agenda_id"],
+                ),
+            )
+
+            cliente_atualizacoes = [
+                "ultima_interacao_em = NOW()",
+                "atualizado_em = NOW()",
+            ]
+            cliente_valores: list[Any] = []
+
+            if dados.cliente_status is not None:
+                cliente_atualizacoes.append("status = %s")
+                cliente_valores.append(dados.cliente_status)
+
+            if dados.proxima_acao_em is not None:
+                cliente_atualizacoes.append("proxima_acao_em = %s")
+                cliente_valores.append(dados.proxima_acao_em)
+
+            cursor.execute(
+                f"""
+                UPDATE comercial.clientes
+                SET {", ".join(cliente_atualizacoes)}
+                WHERE id = %s;
+                """,
+                [*cliente_valores, chamada["cliente_id"]],
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.interacoes (
+                    cliente_id,
+                    vendedor_id,
+                    canal,
+                    direcao,
+                    tipo,
+                    mensagem,
+                    resumo,
+                    intencao,
+                    anexos
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'telefone',
+                    'saida',
+                    'chamada_ia',
+                    %s,
+                    %s,
+                    %s,
+                    %s
+                );
+                """,
+                (
+                    chamada["cliente_id"],
+                    chamada["vendedor_id"],
+                    dados.transcricao,
+                    dados.resumo,
+                    dados.intencao,
+                    Jsonb(
+                        [
+                            {
+                                "tipo": "gravacao",
+                                "url": dados.gravacao_url,
+                            }
+                        ]
+                        if dados.gravacao_url
+                        else []
+                    ),
+                ),
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    vendedor_id,
+                    cliente_id,
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso,
+                    custo
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'finalizar_chamada',
+                    'api_comercial',
+                    %s,
+                    %s,
+                    TRUE,
+                    %s
+                );
+                """,
+                (
+                    chamada["vendedor_id"],
+                    chamada["cliente_id"],
+                    Jsonb(
+                        {
+                            "chamada_id": str(chamada_id),
+                            "agenda_status": dados.agenda_status,
+                        }
+                    ),
+                    Jsonb(
+                        {
+                            "status": dados.status,
+                            "atendida": dados.atendida,
+                            "resultado": dados.resultado,
+                        }
+                    ),
+                    custo_total,
+                ),
+            )
+
+            chamada_finalizada = obter_chamada_detalhada(cursor, chamada_id)
+
+        conexao.commit()
+        return chamada_finalizada
