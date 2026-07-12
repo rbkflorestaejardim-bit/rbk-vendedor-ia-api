@@ -1,0 +1,848 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gestão do Encarte — RBK Distribuidora</title>
+  <style>
+    :root {
+      --verde: rgb(30, 85, 30);
+      --verde-escuro: rgb(21, 63, 21);
+      --laranja: rgb(240, 120, 40);
+      --branco: #ffffff;
+      --fundo: #f4f6f4;
+      --texto: #1f2a1f;
+      --muted: #667266;
+      --borda: #d9e0d9;
+      --erro: #a82828;
+      --sucesso: #1d6f32;
+      --sombra: 0 8px 28px rgba(20, 50, 20, 0.09);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--fundo);
+      color: var(--texto);
+      font-family: Arial, Helvetica, sans-serif;
+    }
+
+    header {
+      background: var(--verde);
+      color: var(--branco);
+      padding: 22px 28px;
+      border-bottom: 5px solid var(--laranja);
+    }
+
+    header h1 {
+      margin: 0 0 5px;
+      font-size: 24px;
+    }
+
+    header p {
+      margin: 0;
+      opacity: 0.9;
+      font-size: 14px;
+    }
+
+    main {
+      width: min(1250px, calc(100% - 28px));
+      margin: 22px auto 42px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 16px;
+    }
+
+    .card {
+      background: var(--branco);
+      border: 1px solid var(--borda);
+      border-radius: 12px;
+      padding: 18px;
+      box-shadow: var(--sombra);
+    }
+
+    .col-12 { grid-column: span 12; }
+    .col-7 { grid-column: span 7; }
+    .col-5 { grid-column: span 5; }
+
+    h2 {
+      margin: 0 0 14px;
+      color: var(--verde);
+      font-size: 18px;
+    }
+
+    .subtitulo {
+      color: var(--muted);
+      margin: -7px 0 16px;
+      font-size: 13px;
+    }
+
+    label {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    input, select, textarea, button {
+      font: inherit;
+    }
+
+    input, select, textarea {
+      width: 100%;
+      border: 1px solid #bac5ba;
+      border-radius: 8px;
+      padding: 10px 11px;
+      background: #fff;
+      color: var(--texto);
+    }
+
+    textarea {
+      min-height: 76px;
+      resize: vertical;
+    }
+
+    input:focus, select:focus, textarea:focus {
+      outline: 2px solid rgba(240, 120, 40, 0.25);
+      border-color: var(--laranja);
+    }
+
+    .campos {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 12px;
+    }
+
+    .campo-12 { grid-column: span 12; }
+    .campo-6 { grid-column: span 6; }
+    .campo-4 { grid-column: span 4; }
+    .campo-3 { grid-column: span 3; }
+
+    .linha-botoes {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 13px;
+    }
+
+    button {
+      border: 0;
+      border-radius: 8px;
+      padding: 10px 15px;
+      cursor: pointer;
+      font-weight: 700;
+    }
+
+    .primario {
+      background: var(--verde);
+      color: var(--branco);
+    }
+
+    .primario:hover { background: var(--verde-escuro); }
+
+    .secundario {
+      background: var(--laranja);
+      color: #fff;
+    }
+
+    .neutro {
+      background: #e7ece7;
+      color: var(--texto);
+    }
+
+    .perigo {
+      background: #f7dddd;
+      color: var(--erro);
+    }
+
+    .status {
+      display: none;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin: 0 0 16px;
+      font-size: 14px;
+      white-space: pre-line;
+    }
+
+    .status.ok {
+      display: block;
+      background: #e0f3e4;
+      color: var(--sucesso);
+      border: 1px solid #b8dfc1;
+    }
+
+    .status.erro {
+      display: block;
+      background: #fae3e3;
+      color: var(--erro);
+      border: 1px solid #ecc0c0;
+    }
+
+    .resultado-sku {
+      margin-top: 14px;
+      padding: 14px;
+      border: 1px solid var(--borda);
+      background: #fafcfa;
+      border-radius: 9px;
+      display: none;
+    }
+
+    .resultado-sku.visivel { display: block; }
+
+    .descricao-produto {
+      font-weight: 700;
+      line-height: 1.4;
+      margin-bottom: 8px;
+    }
+
+    .metricas {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .valor {
+      color: var(--verde);
+      font-weight: 700;
+    }
+
+    .tabela-wrap {
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 920px;
+    }
+
+    th, td {
+      padding: 10px 9px;
+      border-bottom: 1px solid var(--borda);
+      text-align: left;
+      vertical-align: middle;
+      font-size: 13px;
+    }
+
+    th {
+      color: var(--verde);
+      background: #f5f8f5;
+      position: sticky;
+      top: 0;
+    }
+
+    td .mini {
+      width: 94px;
+      padding: 7px;
+    }
+
+    .badge {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 4px 8px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .badge.ativo {
+      background: #def0e1;
+      color: var(--sucesso);
+    }
+
+    .badge.inativo {
+      background: #ececec;
+      color: #666;
+    }
+
+    .ofertas {
+      display: grid;
+      gap: 10px;
+    }
+
+    .oferta {
+      border: 1px solid var(--borda);
+      border-left: 5px solid var(--laranja);
+      border-radius: 9px;
+      padding: 12px;
+      background: #fff;
+    }
+
+    .oferta strong {
+      color: var(--verde);
+    }
+
+    .chave-box {
+      display: flex;
+      gap: 10px;
+      align-items: end;
+    }
+
+    .chave-box > div:first-child { flex: 1; }
+
+    .checkbox {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 28px;
+    }
+
+    .checkbox input {
+      width: auto;
+    }
+
+    .rodape-info {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 12px;
+    }
+
+    @media (max-width: 900px) {
+      .col-7, .col-5 { grid-column: span 12; }
+      .campo-6, .campo-4, .campo-3 { grid-column: span 12; }
+      .chave-box { align-items: stretch; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Gestão do Encarte</h1>
+  <p>RBK Distribuidora — cadastro por SKU e seleção de 3 a 5 ofertas</p>
+</header>
+
+<main>
+  <div id="status" class="status"></div>
+
+  <section class="card" style="margin-bottom:16px">
+    <h2>Acesso</h2>
+    <div class="chave-box">
+      <div>
+        <label for="apiKey">Chave da API Comercial</label>
+        <input id="apiKey" type="password" autocomplete="off"
+               placeholder="Cole a API_KEY do serviço api-comercial">
+      </div>
+      <button class="primario" onclick="conectar()">Conectar</button>
+      <button class="neutro" onclick="desconectar()">Limpar chave</button>
+    </div>
+    <div class="rodape-info">
+      A chave fica somente nesta aba do navegador, usando sessionStorage.
+    </div>
+  </section>
+
+  <div class="grid">
+    <section class="card col-5">
+      <h2>Encarte ativo</h2>
+      <p class="subtitulo">O local permanece fixo; altere o período e os SKUs todo mês.</p>
+
+      <div class="campos">
+        <div class="campo-12">
+          <label for="titulo">Nome do encarte</label>
+          <input id="titulo" placeholder="Ex.: Encarte Agosto 2026">
+        </div>
+        <div class="campo-6">
+          <label for="inicio">Início da vigência</label>
+          <input id="inicio" type="date">
+        </div>
+        <div class="campo-6">
+          <label for="fim">Fim da vigência</label>
+          <input id="fim" type="date">
+        </div>
+        <div class="campo-12 checkbox">
+          <input id="encarteAtivo" type="checkbox">
+          <label for="encarteAtivo" style="margin:0">Encarte ativo</label>
+        </div>
+      </div>
+
+      <div class="linha-botoes">
+        <button class="primario" onclick="salvarConfiguracao()">
+          Salvar período
+        </button>
+      </div>
+    </section>
+
+    <section class="card col-7">
+      <h2>Adicionar produto pelo SKU</h2>
+      <p class="subtitulo">
+        A descrição, preços e estoque são consultados no catálogo sincronizado da Olist.
+      </p>
+
+      <div class="campos">
+        <div class="campo-6">
+          <label for="sku">Código SKU</label>
+          <input id="sku" placeholder="Ex.: 13799"
+                 onkeydown="if(event.key==='Enter') consultarSku()">
+        </div>
+        <div class="campo-3">
+          <label for="prioridade">Prioridade</label>
+          <select id="prioridade">
+            <option value="1">1 — Alta</option>
+            <option value="2">2</option>
+            <option value="3" selected>3 — Normal</option>
+            <option value="4">4</option>
+            <option value="5">5 — Baixa</option>
+          </select>
+        </div>
+        <div class="campo-3">
+          <label for="precoEncarte">Preço do encarte</label>
+          <input id="precoEncarte" type="number" min="0.01"
+                 step="0.01" placeholder="Opcional">
+        </div>
+        <div class="campo-12">
+          <label for="observacao">Observação comercial</label>
+          <textarea id="observacao"
+            placeholder="Ex.: destacar economia, venda em caixa, condição especial..."></textarea>
+        </div>
+      </div>
+
+      <div class="linha-botoes">
+        <button class="secundario" onclick="consultarSku()">
+          Consultar SKU
+        </button>
+        <button class="primario" id="btnAdicionar"
+                onclick="adicionarProduto()" disabled>
+          Adicionar ao encarte
+        </button>
+      </div>
+
+      <div id="resultadoSku" class="resultado-sku"></div>
+    </section>
+
+    <section class="card col-12">
+      <h2>Produtos cadastrados no encarte</h2>
+      <div class="tabela-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>SKU</th>
+              <th>Descrição</th>
+              <th>Preço catálogo</th>
+              <th>Preço encarte</th>
+              <th>Prioridade</th>
+              <th>Status</th>
+              <th>Observação</th>
+              <th>Ações</th>
+            </tr>
+          </thead>
+          <tbody id="corpoTabela">
+            <tr><td colspan="8">Conecte-se para carregar os produtos.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card col-12">
+      <h2>Prévia das ofertas do Carlos</h2>
+      <p class="subtitulo">
+        Mostra de 3 a 5 produtos ativos, com preço e estoque disponíveis.
+      </p>
+      <div class="linha-botoes" style="margin-bottom:14px">
+        <select id="quantidadeOferta" style="width:190px">
+          <option value="3">Mostrar 3 produtos</option>
+          <option value="4">Mostrar 4 produtos</option>
+          <option value="5" selected>Mostrar 5 produtos</option>
+        </select>
+        <button class="secundario" onclick="carregarOfertas()">
+          Gerar prévia
+        </button>
+      </div>
+      <div id="ofertas" class="ofertas">
+        <div class="rodape-info">Nenhuma prévia gerada.</div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script>
+  let produtoConsultado = null;
+
+  function chave() {
+    return sessionStorage.getItem("rbk_api_key") || "";
+  }
+
+  function mostrarStatus(texto, tipo = "ok") {
+    const el = document.getElementById("status");
+    el.className = "status " + tipo;
+    el.textContent = texto;
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function limparStatus() {
+    const el = document.getElementById("status");
+    el.className = "status";
+    el.textContent = "";
+  }
+
+  async function api(caminho, opcoes = {}) {
+    const apiKey = chave();
+    if (!apiKey) {
+      throw new Error("Informe a chave da API Comercial.");
+    }
+
+    const headers = Object.assign(
+      { "X-API-Key": apiKey },
+      opcoes.headers || {}
+    );
+
+    if (opcoes.body && !headers["Content-Type"]) {
+      headers["Content-Type"] = "application/json";
+    }
+
+    const resposta = await fetch(caminho, {
+      ...opcoes,
+      headers
+    });
+
+    const texto = await resposta.text();
+    let dados = {};
+    try {
+      dados = texto ? JSON.parse(texto) : {};
+    } catch (_) {
+      dados = { detail: texto };
+    }
+
+    if (!resposta.ok) {
+      const detalhe = typeof dados.detail === "string"
+        ? dados.detail
+        : JSON.stringify(dados.detail || dados);
+      throw new Error(detalhe || "Falha na requisição.");
+    }
+
+    return dados;
+  }
+
+  async function conectar() {
+    const valor = document.getElementById("apiKey").value.trim();
+    if (!valor) {
+      mostrarStatus("Informe a chave da API.", "erro");
+      return;
+    }
+
+    sessionStorage.setItem("rbk_api_key", valor);
+    limparStatus();
+
+    try {
+      await Promise.all([
+        carregarConfiguracao(),
+        carregarProdutos()
+      ]);
+      mostrarStatus("Conexão realizada e dados carregados.");
+    } catch (erro) {
+      mostrarStatus(erro.message, "erro");
+    }
+  }
+
+  function desconectar() {
+    sessionStorage.removeItem("rbk_api_key");
+    document.getElementById("apiKey").value = "";
+    mostrarStatus("Chave removida desta aba.");
+  }
+
+  async function carregarConfiguracao() {
+    const dados = await api("/encarte/configuracao");
+    document.getElementById("titulo").value = dados.titulo || "";
+    document.getElementById("inicio").value = dados.inicio_vigencia || "";
+    document.getElementById("fim").value = dados.fim_vigencia || "";
+    document.getElementById("encarteAtivo").checked = !!dados.ativo;
+  }
+
+  async function salvarConfiguracao() {
+    limparStatus();
+    try {
+      const dados = await api("/encarte/configuracao", {
+        method: "PUT",
+        body: JSON.stringify({
+          titulo: document.getElementById("titulo").value.trim(),
+          inicio_vigencia: document.getElementById("inicio").value,
+          fim_vigencia: document.getElementById("fim").value,
+          ativo: document.getElementById("encarteAtivo").checked
+        })
+      });
+      mostrarStatus("Configuração salva: " + dados.titulo);
+    } catch (erro) {
+      mostrarStatus(erro.message, "erro");
+    }
+  }
+
+  function moeda(valor) {
+    if (valor === null || valor === undefined || valor === "") return "—";
+    return Number(valor).toLocaleString("pt-BR", {
+      style: "currency",
+      currency: "BRL"
+    });
+  }
+
+  async function consultarSku() {
+    limparStatus();
+    produtoConsultado = null;
+    document.getElementById("btnAdicionar").disabled = true;
+
+    const codigo = document.getElementById("sku").value.trim();
+    if (!codigo) {
+      mostrarStatus("Informe o SKU.", "erro");
+      return;
+    }
+
+    try {
+      const produto = await api(
+        "/encarte/catalogo/" + encodeURIComponent(codigo)
+      );
+      produtoConsultado = produto;
+      const estoque = produto.estoque || {};
+      const resultado = document.getElementById("resultadoSku");
+
+      resultado.innerHTML = "";
+      resultado.className = "resultado-sku visivel";
+
+      const descricao = document.createElement("div");
+      descricao.className = "descricao-produto";
+      descricao.textContent = produto.sku + " — " + produto.descricao;
+
+      const metricas = document.createElement("div");
+      metricas.className = "metricas";
+
+      const normal = document.createElement("span");
+      normal.innerHTML = "Preço normal: <span class='valor'>" +
+        moeda(produto.preco) + "</span>";
+
+      const promocional = document.createElement("span");
+      promocional.innerHTML = "Preço promocional: <span class='valor'>" +
+        moeda(produto.preco_promocional || produto.preco_efetivo) + "</span>";
+
+      const saldo = document.createElement("span");
+      saldo.innerHTML = "Estoque disponível: <span class='valor'>" +
+        (estoque.disponivel ?? "não informado") + "</span>";
+
+      metricas.append(normal, promocional, saldo);
+      resultado.append(descricao, metricas);
+
+      if (!document.getElementById("precoEncarte").value) {
+        const sugerido = produto.preco_promocional || produto.preco_efetivo;
+        if (sugerido) {
+          document.getElementById("precoEncarte").value =
+            Number(sugerido).toFixed(2);
+        }
+      }
+
+      document.getElementById("btnAdicionar").disabled = false;
+    } catch (erro) {
+      document.getElementById("resultadoSku").className = "resultado-sku";
+      mostrarStatus(erro.message, "erro");
+    }
+  }
+
+  async function adicionarProduto() {
+    if (!produtoConsultado) {
+      mostrarStatus("Consulte o SKU antes de adicionar.", "erro");
+      return;
+    }
+
+    limparStatus();
+    const precoCampo = document.getElementById("precoEncarte").value;
+
+    try {
+      await api("/encarte/produtos", {
+        method: "POST",
+        body: JSON.stringify({
+          sku: produtoConsultado.sku,
+          preco_encarte: precoCampo ? Number(precoCampo) : null,
+          prioridade: Number(document.getElementById("prioridade").value),
+          observacao: document.getElementById("observacao").value.trim() || null
+        })
+      });
+
+      mostrarStatus("Produto adicionado ao encarte.");
+      document.getElementById("sku").value = "";
+      document.getElementById("precoEncarte").value = "";
+      document.getElementById("observacao").value = "";
+      document.getElementById("prioridade").value = "3";
+      document.getElementById("resultadoSku").className = "resultado-sku";
+      document.getElementById("btnAdicionar").disabled = true;
+      produtoConsultado = null;
+      await carregarProdutos();
+    } catch (erro) {
+      mostrarStatus(erro.message, "erro");
+    }
+  }
+
+  async function carregarProdutos() {
+    const dados = await api("/encarte/produtos");
+    const corpo = document.getElementById("corpoTabela");
+    corpo.innerHTML = "";
+
+    if (!dados.itens.length) {
+      corpo.innerHTML =
+        "<tr><td colspan='8'>Nenhum produto cadastrado.</td></tr>";
+      return;
+    }
+
+    for (const item of dados.itens) {
+      const tr = document.createElement("tr");
+      const descricao = item.descricao_catalogo ||
+        item.descricao_snapshot || "—";
+      const precoCatalogo = item.preco_promocional ||
+        item.preco_catalogo || item.preco_normal;
+
+      tr.innerHTML = `
+        <td><strong>${escapeHtml(item.sku)}</strong></td>
+        <td>${escapeHtml(descricao)}</td>
+        <td>${moeda(precoCatalogo)}</td>
+        <td>
+          <input class="mini" id="preco-${item.id}" type="number"
+                 min="0.01" step="0.01"
+                 value="${item.preco_encarte ?? ""}">
+        </td>
+        <td>
+          <select class="mini" id="prioridade-${item.id}">
+            ${[1,2,3,4,5].map(n =>
+              `<option value="${n}" ${n === item.prioridade ? "selected" : ""}>${n}</option>`
+            ).join("")}
+          </select>
+        </td>
+        <td>
+          <label class="badge ${item.ativo ? "ativo" : "inativo"}">
+            <input id="ativo-${item.id}" type="checkbox"
+                   ${item.ativo ? "checked" : ""}
+                   style="width:auto;margin-right:5px">
+            ${item.ativo ? "Ativo" : "Inativo"}
+          </label>
+        </td>
+        <td>
+          <input id="obs-${item.id}" value="${escapeAttr(item.observacao || "")}"
+                 placeholder="Observação">
+        </td>
+        <td>
+          <button class="neutro" onclick="salvarItem('${item.id}')">Salvar</button>
+          <button class="perigo" onclick="removerItem('${item.id}', '${escapeJs(item.sku)}')">Excluir</button>
+        </td>
+      `;
+      corpo.appendChild(tr);
+    }
+  }
+
+  async function salvarItem(id) {
+    const preco = document.getElementById("preco-" + id).value;
+    try {
+      await api("/encarte/produtos/" + id, {
+        method: "PATCH",
+        body: JSON.stringify({
+          preco_encarte: preco ? Number(preco) : null,
+          prioridade: Number(document.getElementById("prioridade-" + id).value),
+          ativo: document.getElementById("ativo-" + id).checked,
+          observacao: document.getElementById("obs-" + id).value.trim() || null
+        })
+      });
+      mostrarStatus("Produto atualizado.");
+      await carregarProdutos();
+    } catch (erro) {
+      mostrarStatus(erro.message, "erro");
+    }
+  }
+
+  async function removerItem(id, sku) {
+    if (!confirm("Excluir o SKU " + sku + " do encarte?")) return;
+
+    try {
+      await api("/encarte/produtos/" + id, {
+        method: "DELETE"
+      });
+      mostrarStatus("Produto removido.");
+      await carregarProdutos();
+    } catch (erro) {
+      mostrarStatus(erro.message, "erro");
+    }
+  }
+
+  async function carregarOfertas() {
+    const quantidade = document.getElementById("quantidadeOferta").value;
+    const area = document.getElementById("ofertas");
+    area.innerHTML = "<div class='rodape-info'>Consultando preço e estoque...</div>";
+
+    try {
+      const dados = await api(
+        "/encarte/ofertas?quantidade=" + encodeURIComponent(quantidade)
+      );
+      area.innerHTML = "";
+
+      if (!dados.ofertas.length) {
+        area.innerHTML =
+          "<div class='rodape-info'>Nenhum produto disponível para oferta.</div>";
+        return;
+      }
+
+      for (const oferta of dados.ofertas) {
+        const div = document.createElement("div");
+        div.className = "oferta";
+
+        const titulo = document.createElement("strong");
+        titulo.textContent = oferta.sku + " — " + oferta.descricao;
+
+        const detalhes = document.createElement("div");
+        detalhes.className = "metricas";
+        detalhes.style.marginTop = "7px";
+        detalhes.textContent =
+          "Oferta: " + moeda(oferta.preco_oferta) +
+          " | Estoque: " + oferta.estoque_disponivel +
+          " | Prioridade: " + oferta.prioridade;
+
+        const fala = document.createElement("div");
+        fala.style.marginTop = "8px";
+        fala.textContent = oferta.mensagem_sugerida;
+
+        div.append(titulo, detalhes, fala);
+        area.appendChild(div);
+      }
+
+      if (!dados.quantidade_minima_atingida) {
+        const aviso = document.createElement("div");
+        aviso.className = "rodape-info";
+        aviso.textContent =
+          "Há menos de 3 produtos com preço e estoque disponíveis.";
+        area.appendChild(aviso);
+      }
+    } catch (erro) {
+      area.innerHTML = "";
+      mostrarStatus(erro.message, "erro");
+    }
+  }
+
+  function escapeHtml(valor) {
+    return String(valor)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  function escapeAttr(valor) {
+    return escapeHtml(valor);
+  }
+
+  function escapeJs(valor) {
+    return String(valor)
+      .replaceAll("\\", "\\\\")
+      .replaceAll("'", "\\'");
+  }
+
+  window.addEventListener("DOMContentLoaded", async () => {
+    const salva = chave();
+    if (salva) {
+      document.getElementById("apiKey").value = salva;
+      try {
+        await Promise.all([
+          carregarConfiguracao(),
+          carregarProdutos()
+        ]);
+      } catch (_) {
+        // A chave pode ter expirado ou sido alterada.
+      }
+    }
+  });
+</script>
+</body>
+</html>

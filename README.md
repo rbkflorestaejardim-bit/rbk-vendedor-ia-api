@@ -1,24 +1,40 @@
-# RBK Vendedor IA API v0.9.3
+# RBK Vendedor IA API v0.10.0
 
-A busca local passa a reproduzir o modo **palavras-chave** do Olist.
+## Gestão do encarte
 
-## Regra
+Nova tela administrativa:
 
-- todas as palavras-base precisam aparecer em qualquer posição da descrição;
-- a comparação é por substring;
-- `160` também encontra `FS160`, `GX160` e `1600`, como no ERP;
-- características restantes são usadas para relevância;
-- relevância vem antes de preço e estoque;
-- preço e estoque ordenam produtos com a mesma correspondência.
+```text
+/encarte-admin
+```
 
-## Exemplos de palavras-base
+A tela permite:
 
-- cinto de sustentação universal laranja → `cinto sustentacao`;
-- luva de malha pigmentada branca → `luva malha`;
-- embreagem para MS 382 → `embreagem 382`;
-- sabre para MS 170 → `sabre 170`;
-- pistão para FS 160 → `pistao 160`;
-- carburador 43cc → `carburador 43cc`.
+- configurar nome e vigência do encarte;
+- consultar produto pelo SKU no catálogo local da Olist;
+- verificar preço e estoque;
+- adicionar, editar, ativar, inativar ou excluir produtos;
+- definir preço específico do encarte;
+- definir prioridade comercial;
+- visualizar uma prévia de 3 a 5 ofertas.
 
-O prefixo MS/FS não é obrigatório, pois os cadastros podem usar ST, apenas
-o número ou outras abreviações.
+## Endpoint para o vendedor IA
+
+```text
+GET /encarte/ofertas?quantidade=5
+```
+
+O endpoint retorna somente produtos:
+
+- pertencentes ao encarte vigente;
+- ativos;
+- com preço válido;
+- com estoque disponível;
+- ainda não excluídos da rodada de ofertas.
+
+O parâmetro `excluir_skus` permite impedir repetição de produtos.
+
+## Segurança
+
+A página HTML é apenas a interface. Todas as consultas e alterações exigem
+a chave `X-API-Key`. A chave digitada fica no `sessionStorage` da aba.

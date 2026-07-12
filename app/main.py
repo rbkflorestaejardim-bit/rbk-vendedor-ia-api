@@ -8,6 +8,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import asynccontextmanager
+from pathlib import Path
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Literal
@@ -61,6 +62,11 @@ OLIST_ID_LISTA_PRECO = os.getenv(
 ).strip()
 OLIST_TIMEOUT_SECONDS = int(
     os.getenv("OLIST_TIMEOUT_SECONDS", "25")
+)
+
+
+ENCARTE_ADMIN_HTML = Path(__file__).with_name(
+    "encarte_admin.html"
 )
 
 api_key_header = APIKeyHeader(
@@ -371,7 +377,7 @@ def solicitar_token_olist(
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.9.3",
+            "User-Agent": "RBK-Vendedor-IA-API/0.10.0",
         },
     )
 
@@ -609,7 +615,7 @@ def requisicao_get_olist(
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.9.3",
+            "User-Agent": "RBK-Vendedor-IA-API/0.10.0",
         },
     )
 
@@ -1773,6 +1779,67 @@ def pesquisar_produtos_olist(
     }
 
 
+class EncarteConfiguracaoAtualizar(BaseModel):
+    titulo: str = Field(
+        min_length=3,
+        max_length=150,
+    )
+    inicio_vigencia: date
+    fim_vigencia: date
+    ativo: bool = True
+
+    @model_validator(mode="after")
+    def validar_periodo(self):
+        if self.fim_vigencia < self.inicio_vigencia:
+            raise ValueError(
+                "A data final não pode ser anterior à data inicial."
+            )
+        return self
+
+
+class EncarteProdutoAdicionar(BaseModel):
+    sku: str = Field(
+        min_length=1,
+        max_length=80,
+    )
+    preco_encarte: float | None = Field(
+        default=None,
+        gt=0,
+    )
+    prioridade: int = Field(
+        default=3,
+        ge=1,
+        le=5,
+    )
+    observacao: str | None = Field(
+        default=None,
+        max_length=500,
+    )
+
+    @field_validator("sku")
+    @classmethod
+    def normalizar_sku(cls, valor: str) -> str:
+        return valor.strip()
+
+
+class EncarteProdutoAtualizar(BaseModel):
+    preco_encarte: float | None = Field(
+        default=None,
+        gt=0,
+    )
+    prioridade: int | None = Field(
+        default=None,
+        ge=1,
+        le=5,
+    )
+    ativo: bool | None = None
+    observacao: str | None = Field(
+        default=None,
+        max_length=500,
+    )
+
+
+
 class ClienteCriar(BaseModel):
     crm_origem_id: str | None = Field(default=None, max_length=200)
     olist_id: str | None = Field(default=None, max_length=200)
@@ -2052,6 +2119,177 @@ class TwilioTesteInterativo(BaseModel):
         return validar_numero_e164(valor)
 
 
+def buscar_produto_catalogo_exato(
+    cursor,
+    codigo: str,
+) -> dict[str, Any] | None:
+    codigo_limpo = codigo.strip()
+
+    cursor.execute(
+        """
+        SELECT
+            id_olist AS id,
+            sku,
+            descricao,
+            unidade,
+            gtin,
+            preco,
+            preco_promocional,
+            preco_efetivo,
+            preco_disponivel,
+            localizacao,
+            ativo,
+            sincronizado_em
+        FROM comercial.olist_catalogo_produtos
+        WHERE sku = %s
+           OR id_olist::text = %s
+        ORDER BY ativo DESC
+        LIMIT 1;
+        """,
+        (codigo_limpo, codigo_limpo),
+    )
+    return cursor.fetchone()
+
+
+def obter_configuracao_encarte(
+    cursor,
+) -> dict[str, Any]:
+    cursor.execute(
+        """
+        SELECT
+            id,
+            titulo,
+            inicio_vigencia,
+            fim_vigencia,
+            ativo,
+            atualizado_em
+        FROM comercial.encarte_configuracao
+        WHERE id = 1;
+        """
+    )
+    configuracao = cursor.fetchone()
+
+    if configuracao is None:
+        hoje = datetime.now(FUSO_PROJETO).date()
+        inicio = hoje.replace(day=1)
+        if inicio.month == 12:
+            proximo_mes = inicio.replace(
+                year=inicio.year + 1,
+                month=1,
+            )
+        else:
+            proximo_mes = inicio.replace(
+                month=inicio.month + 1,
+            )
+        fim = proximo_mes - timedelta(days=1)
+
+        cursor.execute(
+            """
+            INSERT INTO comercial.encarte_configuracao (
+                id,
+                titulo,
+                inicio_vigencia,
+                fim_vigencia,
+                ativo
+            )
+            VALUES (
+                1,
+                %s,
+                %s,
+                %s,
+                TRUE
+            )
+            RETURNING
+                id,
+                titulo,
+                inicio_vigencia,
+                fim_vigencia,
+                ativo,
+                atualizado_em;
+            """,
+            (
+                f"Encarte {inicio.strftime('%m/%Y')}",
+                inicio,
+                fim,
+            ),
+        )
+        configuracao = cursor.fetchone()
+
+    return configuracao
+
+
+def obter_item_encarte_detalhado(
+    cursor,
+    item_id: UUID,
+) -> dict[str, Any]:
+    cursor.execute(
+        """
+        SELECT
+            ep.id,
+            ep.sku,
+            ep.produto_id_olist,
+            ep.descricao_snapshot,
+            ep.preco_encarte,
+            ep.prioridade,
+            ep.ativo,
+            ep.observacao,
+            ep.criado_em,
+            ep.atualizado_em,
+            cp.descricao AS descricao_catalogo,
+            cp.preco AS preco_normal,
+            cp.preco_promocional,
+            cp.preco_efetivo AS preco_catalogo,
+            cp.preco_disponivel,
+            cp.ativo AS produto_ativo,
+            cp.sincronizado_em
+        FROM comercial.encarte_produtos ep
+        LEFT JOIN comercial.olist_catalogo_produtos cp
+            ON cp.sku = ep.sku
+        WHERE ep.id = %s;
+        """,
+        (item_id,),
+    )
+    item = cursor.fetchone()
+
+    if item is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Produto do encarte não encontrado.",
+        )
+
+    return item
+
+
+def formatar_produto_encarte(
+    produto: dict[str, Any],
+    preco_encarte: float | None = None,
+) -> dict[str, Any]:
+    preco_promocional = normalizar_preco(
+        produto.get("preco_promocional")
+    )
+    preco_catalogo = normalizar_preco(
+        produto.get("preco_efetivo")
+    )
+    preco_normal = normalizar_preco(
+        produto.get("preco")
+    )
+    preco_oferta = (
+        normalizar_preco(preco_encarte)
+        or preco_promocional
+        or preco_catalogo
+        or preco_normal
+    )
+
+    return {
+        **produto,
+        "preco": preco_normal,
+        "preco_promocional": preco_promocional,
+        "preco_catalogo": preco_catalogo,
+        "preco_oferta": preco_oferta,
+    }
+
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not DATABASE_URL:
@@ -2106,7 +2344,9 @@ async def lifespan(app: FastAPI):
                     to_regclass('comercial.consultas_olist') AS tabela_consultas_olist,
                     to_regclass('comercial.olist_catalogo_produtos') AS tabela_catalogo_olist,
                     to_regclass('comercial.olist_catalogo_sincronizacoes') AS tabela_catalogo_sync,
-                    to_regclass('comercial.pendencias_comerciais') AS tabela_pendencias_comerciais;
+                    to_regclass('comercial.pendencias_comerciais') AS tabela_pendencias_comerciais,
+                    to_regclass('comercial.encarte_configuracao') AS tabela_encarte_configuracao,
+                    to_regclass('comercial.encarte_produtos') AS tabela_encarte_produtos;
                 """
             )
             resultado = cursor.fetchone()
@@ -2130,6 +2370,8 @@ async def lifespan(app: FastAPI):
                 resultado["tabela_catalogo_olist"],
                 resultado["tabela_catalogo_sync"],
                 resultado["tabela_pendencias_comerciais"],
+                resultado["tabela_encarte_configuracao"],
+                resultado["tabela_encarte_produtos"],
             ]
 
             if any(tabela is None for tabela in tabelas):
@@ -2143,7 +2385,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RBK Vendedor IA API",
     description="API comercial do projeto piloto RBK Vendedor IA.",
-    version="0.9.3",
+    version="0.10.0",
     lifespan=lifespan,
 )
 
@@ -2154,8 +2396,597 @@ def saude() -> dict[str, str]:
         "status": "ok",
         "servico": "api-comercial",
         "projeto": "RBK Vendedor IA",
-        "versao": "0.9.3",
+        "versao": "0.10.0",
     }
+
+
+@app.get(
+    "/encarte-admin",
+    tags=["Encarte"],
+    include_in_schema=False,
+)
+def tela_administracao_encarte() -> Response:
+    if not ENCARTE_ADMIN_HTML.is_file():
+        return Response(
+            content=(
+                "<h1>Tela do encarte não encontrada</h1>"
+                "<p>O arquivo encarte_admin.html não foi incluído.</p>"
+            ),
+            status_code=500,
+            media_type="text/html",
+        )
+
+    return Response(
+        content=ENCARTE_ADMIN_HTML.read_text(
+            encoding="utf-8"
+        ),
+        media_type="text/html",
+    )
+
+
+@app.get(
+    "/encarte/configuracao",
+    tags=["Encarte"],
+    dependencies=[Depends(validar_api_key)],
+)
+def consultar_configuracao_encarte() -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            configuracao = obter_configuracao_encarte(
+                cursor
+            )
+        conexao.commit()
+
+    hoje = datetime.now(FUSO_PROJETO).date()
+    vigente = bool(
+        configuracao["ativo"]
+        and configuracao["inicio_vigencia"]
+        <= hoje
+        <= configuracao["fim_vigencia"]
+    )
+
+    return {
+        **configuracao,
+        "vigente": vigente,
+        "data_referencia": hoje,
+    }
+
+
+@app.put(
+    "/encarte/configuracao",
+    tags=["Encarte"],
+    dependencies=[Depends(validar_api_key)],
+)
+def atualizar_configuracao_encarte(
+    dados: EncarteConfiguracaoAtualizar,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO comercial.encarte_configuracao (
+                    id,
+                    titulo,
+                    inicio_vigencia,
+                    fim_vigencia,
+                    ativo,
+                    atualizado_em
+                )
+                VALUES (
+                    1,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    NOW()
+                )
+                ON CONFLICT (id) DO UPDATE
+                SET
+                    titulo = EXCLUDED.titulo,
+                    inicio_vigencia = EXCLUDED.inicio_vigencia,
+                    fim_vigencia = EXCLUDED.fim_vigencia,
+                    ativo = EXCLUDED.ativo,
+                    atualizado_em = NOW()
+                RETURNING
+                    id,
+                    titulo,
+                    inicio_vigencia,
+                    fim_vigencia,
+                    ativo,
+                    atualizado_em;
+                """,
+                (
+                    dados.titulo.strip(),
+                    dados.inicio_vigencia,
+                    dados.fim_vigencia,
+                    dados.ativo,
+                ),
+            )
+            configuracao = cursor.fetchone()
+        conexao.commit()
+
+    return configuracao
+
+
+@app.get(
+    "/encarte/catalogo/{codigo}",
+    tags=["Encarte"],
+    dependencies=[Depends(validar_api_key)],
+)
+def consultar_sku_para_encarte(
+    codigo: str,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            produto = buscar_produto_catalogo_exato(
+                cursor,
+                codigo,
+            )
+
+    if produto is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=(
+                "SKU não localizado no catálogo sincronizado."
+            ),
+        )
+
+    produto_formatado = formatar_produto_encarte(
+        produto
+    )
+
+    try:
+        produto_estoque, rate_limit = (
+            enriquecer_estoque_catalogo(
+                produto_formatado
+            )
+        )
+    except HTTPException:
+        raise
+    except Exception as erro:
+        return {
+            **produto_formatado,
+            "estoque": {
+                "status": "consulta_indisponivel",
+                "disponivel": None,
+            },
+            "aviso": (
+                "O produto foi localizado, mas o estoque "
+                f"não pôde ser consultado: {erro}"
+            ),
+        }
+
+    return {
+        **produto_estoque,
+        "rate_limit": rate_limit,
+    }
+
+
+@app.get(
+    "/encarte/produtos",
+    tags=["Encarte"],
+    dependencies=[Depends(validar_api_key)],
+)
+def listar_produtos_encarte() -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    ep.id,
+                    ep.sku,
+                    ep.produto_id_olist,
+                    ep.descricao_snapshot,
+                    ep.preco_encarte,
+                    ep.prioridade,
+                    ep.ativo,
+                    ep.observacao,
+                    ep.criado_em,
+                    ep.atualizado_em,
+                    cp.descricao AS descricao_catalogo,
+                    cp.preco AS preco_normal,
+                    cp.preco_promocional,
+                    cp.preco_efetivo AS preco_catalogo,
+                    cp.preco_disponivel,
+                    cp.ativo AS produto_ativo,
+                    cp.sincronizado_em
+                FROM comercial.encarte_produtos ep
+                LEFT JOIN comercial.olist_catalogo_produtos cp
+                    ON cp.sku = ep.sku
+                ORDER BY
+                    ep.ativo DESC,
+                    ep.prioridade ASC,
+                    COALESCE(
+                        cp.descricao,
+                        ep.descricao_snapshot
+                    );
+                """
+            )
+            itens = cursor.fetchall()
+
+    ativos = sum(
+        1
+        for item in itens
+        if item["ativo"]
+    )
+
+    return {
+        "quantidade": len(itens),
+        "ativos": ativos,
+        "itens": itens,
+    }
+
+
+@app.post(
+    "/encarte/produtos",
+    tags=["Encarte"],
+    dependencies=[Depends(validar_api_key)],
+)
+def adicionar_produto_encarte(
+    dados: EncarteProdutoAdicionar,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            produto = buscar_produto_catalogo_exato(
+                cursor,
+                dados.sku,
+            )
+
+            if produto is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail=(
+                        "SKU não localizado no catálogo sincronizado."
+                    ),
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.encarte_produtos (
+                    sku,
+                    produto_id_olist,
+                    descricao_snapshot,
+                    preco_encarte,
+                    prioridade,
+                    ativo,
+                    observacao
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    TRUE,
+                    %s
+                )
+                ON CONFLICT (sku) DO UPDATE
+                SET
+                    produto_id_olist = EXCLUDED.produto_id_olist,
+                    descricao_snapshot = EXCLUDED.descricao_snapshot,
+                    preco_encarte = EXCLUDED.preco_encarte,
+                    prioridade = EXCLUDED.prioridade,
+                    ativo = TRUE,
+                    observacao = EXCLUDED.observacao,
+                    atualizado_em = NOW()
+                RETURNING id;
+                """,
+                (
+                    produto["sku"],
+                    produto["id"],
+                    produto["descricao"],
+                    dados.preco_encarte,
+                    dados.prioridade,
+                    (
+                        dados.observacao.strip()
+                        if dados.observacao
+                        else None
+                    ),
+                ),
+            )
+            item_id = cursor.fetchone()["id"]
+            item = obter_item_encarte_detalhado(
+                cursor,
+                item_id,
+            )
+        conexao.commit()
+
+    return item
+
+
+@app.patch(
+    "/encarte/produtos/{item_id}",
+    tags=["Encarte"],
+    dependencies=[Depends(validar_api_key)],
+)
+def atualizar_produto_encarte(
+    item_id: UUID,
+    dados: EncarteProdutoAtualizar,
+) -> dict[str, Any]:
+    campos: list[str] = []
+    valores: list[Any] = []
+
+    if "preco_encarte" in dados.model_fields_set:
+        campos.append("preco_encarte = %s")
+        valores.append(dados.preco_encarte)
+
+    if dados.prioridade is not None:
+        campos.append("prioridade = %s")
+        valores.append(dados.prioridade)
+
+    if dados.ativo is not None:
+        campos.append("ativo = %s")
+        valores.append(dados.ativo)
+
+    if "observacao" in dados.model_fields_set:
+        campos.append("observacao = %s")
+        valores.append(
+            dados.observacao.strip()
+            if dados.observacao
+            else None
+        )
+
+    if not campos:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Nenhuma alteração foi informada.",
+        )
+
+    campos.append("atualizado_em = NOW()")
+    valores.append(item_id)
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                f"""
+                UPDATE comercial.encarte_produtos
+                SET {", ".join(campos)}
+                WHERE id = %s
+                RETURNING id;
+                """,
+                valores,
+            )
+            atualizado = cursor.fetchone()
+
+            if atualizado is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail="Produto do encarte não encontrado.",
+                )
+
+            item = obter_item_encarte_detalhado(
+                cursor,
+                item_id,
+            )
+        conexao.commit()
+
+    return item
+
+
+@app.delete(
+    "/encarte/produtos/{item_id}",
+    tags=["Encarte"],
+    dependencies=[Depends(validar_api_key)],
+)
+def remover_produto_encarte(
+    item_id: UUID,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM comercial.encarte_produtos
+                WHERE id = %s
+                RETURNING
+                    id,
+                    sku,
+                    descricao_snapshot;
+                """,
+                (item_id,),
+            )
+            removido = cursor.fetchone()
+
+            if removido is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail="Produto do encarte não encontrado.",
+                )
+        conexao.commit()
+
+    return {
+        "removido": True,
+        "produto": removido,
+    }
+
+
+@app.get(
+    "/encarte/ofertas",
+    tags=["Encarte"],
+    dependencies=[Depends(validar_api_key)],
+)
+def selecionar_ofertas_encarte(
+    quantidade: int = Query(
+        default=5,
+        ge=3,
+        le=5,
+    ),
+    excluir_skus: str | None = Query(
+        default=None,
+        description=(
+            "SKUs separados por vírgula que já foram "
+            "oferecidos ou adicionados."
+        ),
+    ),
+) -> dict[str, Any]:
+    hoje = datetime.now(FUSO_PROJETO).date()
+    excluidos = {
+        sku.strip()
+        for sku in (excluir_skus or "").split(",")
+        if sku.strip()
+    }
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            configuracao = obter_configuracao_encarte(
+                cursor
+            )
+
+            vigente = bool(
+                configuracao["ativo"]
+                and configuracao["inicio_vigencia"]
+                <= hoje
+                <= configuracao["fim_vigencia"]
+            )
+
+            if not vigente:
+                conexao.commit()
+                return {
+                    "status": "encarte_inativo",
+                    "configuracao": configuracao,
+                    "quantidade_solicitada": quantidade,
+                    "quantidade_retornada": 0,
+                    "ofertas": [],
+                }
+
+            cursor.execute(
+                """
+                SELECT
+                    ep.id AS encarte_item_id,
+                    ep.sku,
+                    ep.produto_id_olist,
+                    ep.descricao_snapshot,
+                    ep.preco_encarte,
+                    ep.prioridade,
+                    ep.observacao,
+                    cp.id_olist AS id,
+                    cp.descricao,
+                    cp.unidade,
+                    cp.gtin,
+                    cp.preco,
+                    cp.preco_promocional,
+                    cp.preco_efetivo,
+                    cp.preco_disponivel,
+                    cp.localizacao,
+                    cp.ativo,
+                    cp.sincronizado_em
+                FROM comercial.encarte_produtos ep
+                JOIN comercial.olist_catalogo_produtos cp
+                    ON cp.sku = ep.sku
+                WHERE ep.ativo = TRUE
+                  AND cp.ativo = TRUE
+                ORDER BY
+                    ep.prioridade ASC,
+                    MD5(
+                        ep.sku
+                        || CURRENT_DATE::TEXT
+                    )
+                LIMIT 20;
+                """
+            )
+            candidatos = cursor.fetchall()
+        conexao.commit()
+
+    ofertas: list[dict[str, Any]] = []
+    verificados = 0
+    limites_olist: dict[str, str] = {}
+
+    for candidato in candidatos:
+        if candidato["sku"] in excluidos:
+            continue
+
+        verificados += 1
+
+        try:
+            enriquecido, limites_olist = (
+                enriquecer_estoque_catalogo(
+                    candidato
+                )
+            )
+        except Exception:
+            continue
+
+        preco_oferta = (
+            normalizar_preco(
+                candidato.get("preco_encarte")
+            )
+            or normalizar_preco(
+                enriquecido.get("preco_promocional")
+            )
+            or normalizar_preco(
+                enriquecido.get("preco_efetivo")
+            )
+            or normalizar_preco(
+                enriquecido.get("preco")
+            )
+        )
+        disponivel = normalizar_quantidade(
+            (
+                enriquecido.get("estoque")
+                or {}
+            ).get("disponivel")
+        )
+
+        if (
+            preco_oferta is None
+            or disponivel is None
+            or disponivel <= 0
+        ):
+            continue
+
+        ofertas.append(
+            {
+                "encarte_item_id": candidato[
+                    "encarte_item_id"
+                ],
+                "sku": candidato["sku"],
+                "descricao": candidato["descricao"],
+                "preco_normal": normalizar_preco(
+                    enriquecido.get("preco")
+                ),
+                "preco_promocional_catalogo": (
+                    normalizar_preco(
+                        enriquecido.get(
+                            "preco_promocional"
+                        )
+                    )
+                ),
+                "preco_encarte_cadastrado": (
+                    normalizar_preco(
+                        candidato.get("preco_encarte")
+                    )
+                ),
+                "preco_oferta": preco_oferta,
+                "estoque_disponivel": disponivel,
+                "prioridade": candidato["prioridade"],
+                "observacao": candidato["observacao"],
+                "mensagem_sugerida": (
+                    f"Também temos {candidato['descricao']} "
+                    f"por R$ {preco_oferta:.2f}. "
+                    "Quer aproveitar e incluir algumas unidades?"
+                ).replace(".", ",", 1),
+            }
+        )
+
+        if len(ofertas) >= quantidade:
+            break
+
+        aguardar_rate_limit_olist(limites_olist)
+
+    return {
+        "status": (
+            "ofertas_disponiveis"
+            if ofertas
+            else "sem_ofertas_disponiveis"
+        ),
+        "configuracao": configuracao,
+        "quantidade_solicitada": quantidade,
+        "quantidade_retornada": len(ofertas),
+        "quantidade_minima_atingida": len(ofertas) >= 3,
+        "candidatos_verificados": verificados,
+        "ofertas": ofertas,
+        "rate_limit": limites_olist,
+    }
+
 
 
 @app.get(
