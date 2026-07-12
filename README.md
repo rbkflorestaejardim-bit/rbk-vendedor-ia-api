@@ -1,46 +1,30 @@
-# RBK Vendedor IA API v0.8.2
+# RBK Vendedor IA API v0.9.0
 
-A pesquisa de produtos passa a seguir a lógica operacional do ERP Olist:
-palavras e números são procurados na descrição, sem exigir a mesma ordem.
+A pesquisa deixa de depender das limitações da busca remota por `nome` em
+cada atendimento. A API sincroniza todos os produtos ativos do Olist em um
+catálogo local no PostgreSQL e pesquisa por palavras e números diretamente
+nas descrições.
 
-## Exemplo
+## Fluxo
 
-Pesquisa:
+1. `POST /olist/catalogo/sincronizar`
+2. A API pagina `GET /produtos` sem filtro de nome.
+3. Todos os produtos ativos são gravados localmente.
+4. `GET /olist/produtos/pesquisar` consulta o catálogo local.
+5. Apenas os produtos compatíveis recebem consulta de estoque em tempo real.
+6. Entre os compatíveis, preço e estoque determinam a ordem comercial.
 
-```text
-carburador stihl ms 170
-```
+## Endpoints novos
 
-Resultados compatíveis esperados:
+- `POST /olist/catalogo/sincronizar`
+- `GET /olist/catalogo/status`
+- `GET /olist/catalogo/produto/{codigo}`
 
-```text
-CARBURADOR PARA MOTOSSERRA STIHL MS 170/180
-CARBURADOR ST-170 NOVA 2MIX
-```
+## Resultado esperado
 
-Produtos de modelos diferentes, como MS 461 ou MS 311, são descartados.
+Para `carburador + Stihl + MS 170`, o catálogo deve localizar tanto:
 
-## Ordenação
+- SKU 12933 — CARBURADOR PARA MOTOSSERRA STIHL MS 170/180
+- SKU 2452 — CARBURADOR ST-170 NOVA 2MIX
 
-A segurança da aplicação vem primeiro. Entre produtos compatíveis:
-
-1. produto com preço e estoque disponível;
-2. produto com preço, mas sem estoque;
-3. produto com estoque, mas sem preço;
-4. produto sem preço e sem estoque.
-
-## Campos novos no retorno
-
-- `situacao_comercial`;
-- `prioridade_comercial`;
-- `preco_disponivel`;
-- `tem_estoque`;
-- `modo_busca`;
-- palavras e números encontrados;
-- depósitos retornados pelo estoque.
-
-## Observação
-
-A API não utiliza `idListaPreco` como filtro automático, porque esse filtro
-eliminaria produtos que ainda não possuem preço na lista. Esses produtos
-devem continuar aparecendo depois das opções comercializáveis.
+O SKU 12933 deve vir primeiro quando mantiver preço e estoque disponíveis.

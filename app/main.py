@@ -361,7 +361,7 @@ def solicitar_token_olist(
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.8.2",
+            "User-Agent": "RBK-Vendedor-IA-API/0.9.0",
         },
     )
 
@@ -599,7 +599,7 @@ def requisicao_get_olist(
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.8.2",
+            "User-Agent": "RBK-Vendedor-IA-API/0.9.0",
         },
     )
 
@@ -739,11 +739,7 @@ def aliases_marca(marca: str | None) -> set[str]:
             tokens.update(aliases)
             tokens.update(tokens_busca(nome))
 
-    return {
-        alias
-        for alias in tokens
-        if alias
-    }
+    return {alias for alias in tokens if alias}
 
 
 def componentes_modelo(
@@ -752,294 +748,29 @@ def componentes_modelo(
     modelo_normalizado = normalizar_texto_busca(modelo)
     prefixos: set[str] = set()
     numeros: set[str] = set()
-    partes: set[str] = set()
 
-    for token in modelo_normalizado.split():
-        for segmento in re.findall(r"[a-z]+|\d+[a-z]*", token):
-            partes.add(segmento)
-
-            if segmento.isalpha():
-                prefixos.add(segmento)
-                continue
-
-            numero = re.search(r"\d+", segmento)
-            if numero:
-                numeros.add(numero.group(0))
-
-            prefixos.update(re.findall(r"[a-z]+", segmento))
-
-    compacto = modelo_normalizado.replace(" ", "")
-    for segmento in re.findall(r"[a-z]+|\d+[a-z]*", compacto):
-        partes.add(segmento)
-
+    for segmento in re.findall(
+        r"[a-z]+|\d+[a-z]*",
+        modelo_normalizado.replace(" ", ""),
+    ):
         if segmento.isalpha():
             prefixos.add(segmento)
-        else:
-            numero = re.search(r"\d+", segmento)
-            if numero:
-                numeros.add(numero.group(0))
+            continue
 
-            prefixos.update(re.findall(r"[a-z]+", segmento))
+        numero = re.search(r"\d+", segmento)
+        if numero:
+            numeros.add(numero.group(0))
+        prefixos.update(re.findall(r"[a-z]+", segmento))
+
+    for token in modelo_normalizado.split():
+        if token.isalpha():
+            prefixos.add(token)
+        numeros.update(re.findall(r"\d+", token))
 
     return {
         "prefixos": prefixos,
         "numeros": numeros,
-        "partes": partes,
     }
-
-
-def avaliar_correspondencia_produto(
-    item: dict[str, Any],
-    termo: str | None,
-    produto: str | None,
-    marca: str | None,
-    modelo: str | None,
-) -> dict[str, Any]:
-    descricao = normalizar_texto_busca(item.get("descricao"))
-    sku = normalizar_texto_busca(item.get("sku"))
-    base = f"{descricao} {sku}".strip()
-    tokens_base = set(base.split())
-    numeros_base = set(re.findall(r"\d+", base))
-
-    produto_tokens = tokens_busca(produto)
-    marca_solicitada = normalizar_texto_busca(marca)
-    marca_aliases = aliases_marca(marca)
-    modelo_componentes = componentes_modelo(modelo)
-    numeros_modelo = modelo_componentes["numeros"]
-    prefixos_modelo = modelo_componentes["prefixos"]
-
-    produtos_encontrados = sorted(
-        token
-        for token in produto_tokens
-        if token in tokens_base
-    )
-    produto_corresponde = bool(
-        not produto_tokens
-        or len(produtos_encontrados) == len(produto_tokens)
-    )
-
-    aliases_encontrados = sorted(
-        alias
-        for alias in marca_aliases
-        if alias in tokens_base
-    )
-    marca_literal = bool(
-        marca_solicitada
-        and marca_solicitada in base
-    )
-    marca_corresponde = bool(
-        not marca_aliases
-        or aliases_encontrados
-        or marca_literal
-    )
-
-    numeros_encontrados = sorted(
-        numero
-        for numero in numeros_modelo
-        if numero in numeros_base
-    )
-    numero_modelo_corresponde = bool(
-        not numeros_modelo
-        or len(numeros_encontrados) == len(numeros_modelo)
-    )
-
-    prefixos_encontrados = sorted(
-        prefixo
-        for prefixo in prefixos_modelo
-        if prefixo in tokens_base
-    )
-    prefixo_literal_corresponde = bool(
-        not prefixos_modelo
-        or len(prefixos_encontrados) == len(prefixos_modelo)
-    )
-
-    # Alguns cadastros antigos da RBK usam ST-170 em vez de STIHL MS 170.
-    # Nesse caso, ST + o número correto é aceito como aplicação equivalente.
-    stihl_alias_modelo = bool(
-        marca_solicitada == "stihl"
-        and "st" in tokens_base
-        and numero_modelo_corresponde
-    )
-    prefixo_modelo_corresponde = bool(
-        prefixo_literal_corresponde
-        or stihl_alias_modelo
-    )
-
-    correspondencia_palavras = bool(
-        produto_corresponde
-        and marca_corresponde
-        and numero_modelo_corresponde
-        and prefixo_modelo_corresponde
-    )
-
-    termo_tokens = tokens_busca(termo)
-    termo_tokens_encontrados = sorted(
-        token
-        for token in termo_tokens
-        if token in tokens_base
-    )
-    percentual_termo = (
-        len(termo_tokens_encontrados)
-        / len(termo_tokens)
-        if termo_tokens
-        else 0.0
-    )
-
-    pontuacao = 0
-    motivos: list[str] = []
-
-    if produto_corresponde:
-        pontuacao += 100
-        motivos.append("produto")
-    elif produto_tokens:
-        pontuacao -= 200
-        motivos.append("produto_ausente")
-
-    if marca_corresponde:
-        pontuacao += 70
-        motivos.append(
-            "marca_literal"
-            if marca_literal
-            else "marca_alias"
-        )
-    elif marca_aliases:
-        pontuacao -= 100
-        motivos.append("marca_ausente")
-
-    if numero_modelo_corresponde:
-        pontuacao += 160
-        motivos.append("numero_modelo")
-    elif numeros_modelo:
-        pontuacao -= 250
-        motivos.append("numero_modelo_ausente")
-
-    if prefixo_literal_corresponde and prefixos_modelo:
-        pontuacao += 50
-        motivos.append("prefixo_modelo")
-    elif stihl_alias_modelo:
-        pontuacao += 35
-        motivos.append("stihl_st_numero")
-    elif prefixos_modelo:
-        pontuacao -= 30
-        motivos.append("prefixo_modelo_ausente")
-
-    if termo_tokens:
-        pontuacao += int(percentual_termo * 60)
-
-    if correspondencia_palavras:
-        pontuacao += 200
-        motivos.append("todas_palavras_relevantes")
-
-    return {
-        "pontuacao": pontuacao,
-        "correspondencia_exata": correspondencia_palavras,
-        "correspondencia_palavras": correspondencia_palavras,
-        "produto_corresponde": produto_corresponde,
-        "marca_corresponde": marca_corresponde,
-        "modelo_corresponde": bool(
-            numero_modelo_corresponde
-            and prefixo_modelo_corresponde
-        ),
-        "produto_encontrado": produtos_encontrados,
-        "marca_aliases_encontrados": aliases_encontrados,
-        "numeros_modelo_encontrados": numeros_encontrados,
-        "prefixos_modelo_encontrados": prefixos_encontrados,
-        "palavras_termo_encontradas": termo_tokens_encontrados,
-        "percentual_termo": round(percentual_termo, 4),
-        "motivos": motivos,
-    }
-
-
-def montar_consultas_olist(
-    termo: str | None,
-    produto: str | None,
-    marca: str | None,
-    modelo: str | None,
-) -> list[str]:
-    modelo_componentes = componentes_modelo(modelo)
-    numeros = sorted(modelo_componentes["numeros"])
-    prefixos = sorted(modelo_componentes["prefixos"])
-
-    # A pesquisa do ERP trabalha por palavras contidas na descrição. A API
-    # recebe uma busca por vez; portanto consultamos primeiro os termos mais
-    # seletivos e unimos os resultados localmente.
-    consultas_brutas: list[str | None] = []
-
-    consultas_brutas.extend(numeros)
-
-    if produto and modelo:
-        consultas_brutas.append(f"{produto} {modelo}")
-
-    if marca and modelo:
-        consultas_brutas.append(f"{marca} {modelo}")
-
-    consultas_brutas.extend(
-        [
-            termo,
-            modelo,
-            produto,
-        ]
-    )
-
-    for prefixo in prefixos:
-        for numero in numeros:
-            consultas_brutas.extend(
-                [
-                    f"{prefixo} {numero}",
-                    f"{prefixo}-{numero}",
-                    f"{prefixo}{numero}",
-                ]
-            )
-
-    if normalizar_texto_busca(marca) == "stihl":
-        for numero in numeros:
-            consultas_brutas.extend(
-                [
-                    f"st {numero}",
-                    f"st-{numero}",
-                    f"st{numero}",
-                ]
-            )
-
-    consultas: list[str] = []
-    vistos: set[str] = set()
-
-    for consulta in consultas_brutas:
-        consulta_limpa = re.sub(
-            r"\s+",
-            " ",
-            str(consulta or ""),
-        ).strip()
-        chave = normalizar_texto_busca(consulta_limpa)
-
-        if consulta_limpa and chave not in vistos:
-            vistos.add(chave)
-            consultas.append(consulta_limpa)
-
-    return consultas[:8]
-
-
-def extrair_objeto_produto_detalhado(
-    retorno: Any,
-) -> dict[str, Any]:
-    if not isinstance(retorno, dict):
-        return {}
-
-    for chave in ("produto", "item", "dados"):
-        valor = retorno.get(chave)
-        if isinstance(valor, dict):
-            return valor
-
-    return retorno
-
-
-def primeiro_valor_definido(
-    *valores: Any,
-) -> Any:
-    for valor in valores:
-        if valor is not None:
-            return valor
-    return None
 
 
 def normalizar_preco(
@@ -1078,49 +809,606 @@ def normalizar_quantidade(
         return None
 
 
-def enriquecer_produto_olist(
+def preco_efetivo_item_olist(
+    item: dict[str, Any],
+) -> float | None:
+    precos = item.get("precos")
+    if not isinstance(precos, dict):
+        precos = {}
+
+    promocional = normalizar_preco(
+        precos.get("precoPromocional")
+    )
+    normal = normalizar_preco(
+        precos.get("preco")
+    )
+    return promocional or normal
+
+
+def aguardar_rate_limit_olist(
+    limites: dict[str, str],
+) -> None:
+    try:
+        restante = int(limites.get("restante") or 999)
+        reset = int(limites.get("reset_segundos") or 0)
+    except (TypeError, ValueError):
+        return
+
+    if restante <= 2 and reset > 0:
+        time_module.sleep(min(reset + 1, 65))
+
+
+def sincronizar_catalogo_olist(
+    max_paginas: int,
+) -> dict[str, Any]:
+    inicio = time_module.perf_counter()
+    lote = uuid4()
+    itens_catalogo: dict[int, dict[str, Any]] = {}
+    limites_olist: dict[str, str] = {}
+    offset = 0
+    limite_pagina = 100
+    paginas = 0
+    total_informado = 0
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO comercial.olist_catalogo_sincronizacoes (
+                    id,
+                    status,
+                    inicio_em
+                )
+                VALUES (%s, 'em_andamento', NOW());
+                """,
+                (lote,),
+            )
+        conexao.commit()
+
+    try:
+        while paginas < max_paginas:
+            retorno, limites_olist = requisicao_get_olist(
+                "produtos",
+                {
+                    "situacao": "A",
+                    "limit": limite_pagina,
+                    "offset": offset,
+                },
+            )
+            paginas += 1
+
+            pagina_itens = retorno.get("itens") or []
+            paginacao = retorno.get("paginacao") or {}
+            total_informado = int(
+                paginacao.get("total") or total_informado
+            )
+
+            for item in pagina_itens:
+                produto_id = item.get("id")
+                descricao = str(
+                    item.get("descricao") or ""
+                ).strip()
+
+                if produto_id is None or not descricao:
+                    continue
+
+                descricao_normalizada = normalizar_texto_busca(
+                    descricao
+                )
+                sku = str(item.get("sku") or "").strip()
+                tokens = sorted(
+                    set(
+                        tokens_busca(descricao)
+                        + tokens_busca(sku)
+                    )
+                )
+                precos = item.get("precos")
+                if not isinstance(precos, dict):
+                    precos = {}
+
+                preco = normalizar_preco(
+                    precos.get("preco")
+                )
+                preco_promocional = normalizar_preco(
+                    precos.get("precoPromocional")
+                )
+                preco_efetivo = (
+                    preco_promocional or preco
+                )
+
+                itens_catalogo[int(produto_id)] = {
+                    "id_olist": int(produto_id),
+                    "sku": sku or None,
+                    "descricao": descricao,
+                    "descricao_normalizada": (
+                        descricao_normalizada
+                    ),
+                    "tokens": tokens,
+                    "unidade": item.get("unidade"),
+                    "gtin": item.get("gtin"),
+                    "situacao": "A",
+                    "preco": preco,
+                    "preco_promocional": preco_promocional,
+                    "preco_efetivo": preco_efetivo,
+                    "preco_disponivel": (
+                        preco_efetivo is not None
+                    ),
+                    "localizacao": (
+                        item.get("estoque") or {}
+                    ).get("localizacao"),
+                    "data_criacao_olist": item.get(
+                        "dataCriacao"
+                    ),
+                    "data_alteracao_olist": item.get(
+                        "dataAlteracao"
+                    ),
+                    "dados": item,
+                }
+
+            offset += limite_pagina
+            aguardar_rate_limit_olist(limites_olist)
+
+            if (
+                not pagina_itens
+                or (
+                    total_informado > 0
+                    and offset >= total_informado
+                )
+            ):
+                break
+
+        sincronizacao_completa = bool(
+            total_informado == 0
+            or len(itens_catalogo) >= total_informado
+        )
+
+        with obter_conexao() as conexao:
+            with conexao.cursor() as cursor:
+                for item in itens_catalogo.values():
+                    cursor.execute(
+                        """
+                        INSERT INTO comercial.olist_catalogo_produtos (
+                            id_olist,
+                            sku,
+                            descricao,
+                            descricao_normalizada,
+                            tokens,
+                            unidade,
+                            gtin,
+                            situacao,
+                            preco,
+                            preco_promocional,
+                            preco_efetivo,
+                            preco_disponivel,
+                            localizacao,
+                            data_criacao_olist,
+                            data_alteracao_olist,
+                            dados,
+                            ativo,
+                            lote_sincronizacao,
+                            sincronizado_em
+                        )
+                        VALUES (
+                            %(id_olist)s,
+                            %(sku)s,
+                            %(descricao)s,
+                            %(descricao_normalizada)s,
+                            %(tokens)s,
+                            %(unidade)s,
+                            %(gtin)s,
+                            %(situacao)s,
+                            %(preco)s,
+                            %(preco_promocional)s,
+                            %(preco_efetivo)s,
+                            %(preco_disponivel)s,
+                            %(localizacao)s,
+                            %(data_criacao_olist)s,
+                            %(data_alteracao_olist)s,
+                            %(dados)s,
+                            TRUE,
+                            %(lote)s,
+                            NOW()
+                        )
+                        ON CONFLICT (id_olist) DO UPDATE
+                        SET
+                            sku = EXCLUDED.sku,
+                            descricao = EXCLUDED.descricao,
+                            descricao_normalizada = (
+                                EXCLUDED.descricao_normalizada
+                            ),
+                            tokens = EXCLUDED.tokens,
+                            unidade = EXCLUDED.unidade,
+                            gtin = EXCLUDED.gtin,
+                            situacao = EXCLUDED.situacao,
+                            preco = EXCLUDED.preco,
+                            preco_promocional = (
+                                EXCLUDED.preco_promocional
+                            ),
+                            preco_efetivo = EXCLUDED.preco_efetivo,
+                            preco_disponivel = (
+                                EXCLUDED.preco_disponivel
+                            ),
+                            localizacao = EXCLUDED.localizacao,
+                            data_criacao_olist = (
+                                EXCLUDED.data_criacao_olist
+                            ),
+                            data_alteracao_olist = (
+                                EXCLUDED.data_alteracao_olist
+                            ),
+                            dados = EXCLUDED.dados,
+                            ativo = TRUE,
+                            lote_sincronizacao = (
+                                EXCLUDED.lote_sincronizacao
+                            ),
+                            sincronizado_em = NOW();
+                        """,
+                        {
+                            **item,
+                            "dados": Jsonb(item["dados"]),
+                            "lote": lote,
+                        },
+                    )
+
+                if sincronizacao_completa:
+                    cursor.execute(
+                        """
+                        UPDATE comercial.olist_catalogo_produtos
+                        SET
+                            ativo = FALSE,
+                            sincronizado_em = NOW()
+                        WHERE ativo = TRUE
+                          AND lote_sincronizacao <> %s;
+                        """,
+                        (lote,),
+                    )
+
+                duracao_ms = int(
+                    (
+                        time_module.perf_counter() - inicio
+                    ) * 1000
+                )
+                cursor.execute(
+                    """
+                    UPDATE comercial.olist_catalogo_sincronizacoes
+                    SET
+                        status = %s,
+                        fim_em = NOW(),
+                        paginas = %s,
+                        total_informado_olist = %s,
+                        total_recebido = %s,
+                        total_gravado = %s,
+                        duracao_ms = %s,
+                        rate_limit = %s
+                    WHERE id = %s;
+                    """,
+                    (
+                        (
+                            "concluida"
+                            if sincronizacao_completa
+                            else "parcial"
+                        ),
+                        paginas,
+                        total_informado,
+                        len(itens_catalogo),
+                        len(itens_catalogo),
+                        duracao_ms,
+                        Jsonb(limites_olist),
+                        lote,
+                    ),
+                )
+            conexao.commit()
+
+        return {
+            "sincronizacao_id": lote,
+            "status": (
+                "concluida"
+                if sincronizacao_completa
+                else "parcial"
+            ),
+            "paginas": paginas,
+            "total_informado_olist": total_informado,
+            "total_recebido": len(itens_catalogo),
+            "total_gravado": len(itens_catalogo),
+            "duracao_ms": duracao_ms,
+            "rate_limit": limites_olist,
+        }
+
+    except Exception as erro:
+        with obter_conexao() as conexao:
+            with conexao.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE comercial.olist_catalogo_sincronizacoes
+                    SET
+                        status = 'erro',
+                        fim_em = NOW(),
+                        paginas = %s,
+                        total_informado_olist = %s,
+                        total_recebido = %s,
+                        erro = %s,
+                        duracao_ms = %s,
+                        rate_limit = %s
+                    WHERE id = %s;
+                    """,
+                    (
+                        paginas,
+                        total_informado,
+                        len(itens_catalogo),
+                        str(erro)[:4000],
+                        int(
+                            (
+                                time_module.perf_counter()
+                                - inicio
+                            ) * 1000
+                        ),
+                        Jsonb(limites_olist),
+                        lote,
+                    ),
+                )
+            conexao.commit()
+        raise
+
+
+def avaliar_correspondencia_catalogo(
+    item: dict[str, Any],
+    termo: str | None,
+    produto: str | None,
+    marca: str | None,
+    modelo: str | None,
+) -> dict[str, Any]:
+    descricao = normalizar_texto_busca(
+        item.get("descricao")
+    )
+    tokens_base = set(
+        item.get("tokens")
+        or tokens_busca(descricao)
+    )
+    numeros_base = set(re.findall(r"\d+", descricao))
+
+    produto_tokens = tokens_busca(produto)
+    marca_solicitada = normalizar_texto_busca(marca)
+    marca_aliases = aliases_marca(marca)
+    modelo_partes = componentes_modelo(modelo)
+    numeros_modelo = modelo_partes["numeros"]
+    prefixos_modelo = modelo_partes["prefixos"]
+
+    produto_ok = bool(
+        not produto_tokens
+        or all(
+            token in tokens_base
+            for token in produto_tokens
+        )
+    )
+
+    marca_literal = bool(
+        marca_solicitada
+        and marca_solicitada in tokens_base
+    )
+    aliases_encontrados = sorted(
+        alias
+        for alias in marca_aliases
+        if alias in tokens_base
+    )
+    marca_ok = bool(
+        not marca_aliases
+        or marca_literal
+        or aliases_encontrados
+    )
+
+    numeros_encontrados = sorted(
+        numero
+        for numero in numeros_modelo
+        if numero in numeros_base
+    )
+    numero_ok = bool(
+        not numeros_modelo
+        or len(numeros_encontrados)
+        == len(numeros_modelo)
+    )
+
+    prefixos_encontrados = sorted(
+        prefixo
+        for prefixo in prefixos_modelo
+        if prefixo in tokens_base
+    )
+    prefixo_literal_ok = bool(
+        not prefixos_modelo
+        or len(prefixos_encontrados)
+        == len(prefixos_modelo)
+    )
+    stihl_alias_ok = bool(
+        marca_solicitada == "stihl"
+        and "st" in tokens_base
+        and numero_ok
+    )
+    prefixo_ok = bool(
+        prefixo_literal_ok or stihl_alias_ok
+    )
+
+    termo_tokens = tokens_busca(termo)
+    termo_encontrados = sorted(
+        token
+        for token in termo_tokens
+        if token in tokens_base
+    )
+    termo_ok = bool(
+        not termo_tokens
+        or len(termo_encontrados) == len(termo_tokens)
+    )
+
+    compatibilidade = bool(
+        produto_ok
+        and marca_ok
+        and numero_ok
+        and prefixo_ok
+        and (
+            termo_ok
+            if not (
+                produto
+                or marca
+                or modelo
+            )
+            else True
+        )
+    )
+
+    pontuacao = 0
+    if produto_ok:
+        pontuacao += 100
+    if marca_literal:
+        pontuacao += 90
+    elif aliases_encontrados:
+        pontuacao += 70
+    if numero_ok:
+        pontuacao += 180
+    if prefixo_literal_ok and prefixos_modelo:
+        pontuacao += 60
+    elif stihl_alias_ok:
+        pontuacao += 40
+    if termo_tokens:
+        pontuacao += int(
+            80
+            * len(termo_encontrados)
+            / max(len(termo_tokens), 1)
+        )
+    if compatibilidade:
+        pontuacao += 250
+
+    return {
+        "pontuacao": pontuacao,
+        "correspondencia_exata": compatibilidade,
+        "correspondencia_palavras": compatibilidade,
+        "produto_corresponde": produto_ok,
+        "marca_corresponde": marca_ok,
+        "modelo_corresponde": bool(
+            numero_ok and prefixo_ok
+        ),
+        "marca_aliases_encontrados": (
+            aliases_encontrados
+        ),
+        "numeros_modelo_encontrados": (
+            numeros_encontrados
+        ),
+        "prefixos_modelo_encontrados": (
+            prefixos_encontrados
+        ),
+        "palavras_termo_encontradas": (
+            termo_encontrados
+        ),
+    }
+
+
+def buscar_candidatos_catalogo(
+    termo: str | None,
+    produto: str | None,
+    marca: str | None,
+    modelo: str | None,
+    limite_candidatos: int = 250,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    produto_tokens = tokens_busca(produto)
+    modelo_partes = componentes_modelo(modelo)
+    numeros_modelo = sorted(modelo_partes["numeros"])
+    marca_tokens = sorted(aliases_marca(marca))
+
+    obrigatorios = sorted(
+        set(produto_tokens + numeros_modelo)
+    )
+
+    if not obrigatorios and termo:
+        obrigatorios = tokens_busca(termo)
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM comercial.olist_catalogo_produtos
+                WHERE ativo = TRUE;
+                """
+            )
+            total_catalogo = cursor.fetchone()["total"]
+
+            cursor.execute(
+                """
+                SELECT
+                    MAX(sincronizado_em) AS sincronizado_em
+                FROM comercial.olist_catalogo_produtos
+                WHERE ativo = TRUE;
+                """
+            )
+            sincronizado_em = cursor.fetchone()[
+                "sincronizado_em"
+            ]
+
+            if total_catalogo == 0:
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail=(
+                        "O catálogo local da Olist está vazio. "
+                        "Execute POST /olist/catalogo/sincronizar."
+                    ),
+                )
+
+            cursor.execute(
+                """
+                SELECT
+                    id_olist AS id,
+                    sku,
+                    descricao,
+                    descricao_normalizada,
+                    tokens,
+                    unidade,
+                    gtin,
+                    preco,
+                    preco_promocional,
+                    preco_efetivo,
+                    preco_disponivel,
+                    localizacao,
+                    sincronizado_em
+                FROM comercial.olist_catalogo_produtos
+                WHERE ativo = TRUE
+                  AND (
+                      cardinality(%s::text[]) = 0
+                      OR tokens @> %s::text[]
+                  )
+                  AND (
+                      cardinality(%s::text[]) = 0
+                      OR tokens && %s::text[]
+                  )
+                ORDER BY
+                    preco_disponivel DESC,
+                    descricao
+                LIMIT %s;
+                """,
+                (
+                    obrigatorios,
+                    obrigatorios,
+                    marca_tokens,
+                    marca_tokens,
+                    limite_candidatos,
+                ),
+            )
+            candidatos = cursor.fetchall()
+
+    return candidatos, {
+        "total_catalogo_ativo": total_catalogo,
+        "catalogo_sincronizado_em": sincronizado_em,
+        "tokens_obrigatorios": obrigatorios,
+        "aliases_marca": marca_tokens,
+    }
+
+
+def enriquecer_estoque_catalogo(
     item: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, str]]:
-    limites_olist: dict[str, str] = {}
-
-    detalhe_retorno, limites_olist = requisicao_get_olist(
-        f"produtos/{item['id']}",
-    )
-    detalhe = extrair_objeto_produto_detalhado(
-        detalhe_retorno
-    )
-
-    precos_detalhe = detalhe.get("precos")
-    if not isinstance(precos_detalhe, dict):
-        precos_detalhe = {}
-
-    preco = normalizar_preco(
-        primeiro_valor_definido(
-            precos_detalhe.get("preco"),
-            detalhe.get("preco"),
-            item.get("preco"),
-        )
-    )
-    preco_promocional = normalizar_preco(
-        primeiro_valor_definido(
-            precos_detalhe.get("precoPromocional"),
-            detalhe.get("precoPromocional"),
-            item.get("preco_promocional"),
-        )
-    )
-    preco_efetivo = preco_promocional or preco
-
-    estoque_retorno, limites_olist = requisicao_get_olist(
+    retorno, limites = requisicao_get_olist(
         f"estoque/{item['id']}",
     )
     estoque = (
-        estoque_retorno.get("estoque")
-        if isinstance(estoque_retorno, dict)
-        and isinstance(
-            estoque_retorno.get("estoque"),
-            dict,
-        )
-        else estoque_retorno
+        retorno.get("estoque")
+        if isinstance(retorno, dict)
+        and isinstance(retorno.get("estoque"), dict)
+        else retorno
     )
     if not isinstance(estoque, dict):
         estoque = {}
@@ -1135,58 +1423,50 @@ def enriquecer_produto_olist(
         estoque.get("disponivel")
     )
 
+    preco = normalizar_preco(item.get("preco"))
+    preco_promocional = normalizar_preco(
+        item.get("preco_promocional")
+    )
+    preco_efetivo = (
+        preco_promocional
+        or normalizar_preco(item.get("preco_efetivo"))
+        or preco
+    )
     tem_preco = preco_efetivo is not None
     tem_estoque = bool(
-        disponivel is not None
-        and disponivel > 0
+        disponivel is not None and disponivel > 0
     )
 
     if tem_preco and tem_estoque:
-        prioridade_comercial = 3
-        situacao_comercial = "preco_e_estoque"
+        prioridade = 3
+        situacao = "preco_e_estoque"
     elif tem_preco:
-        prioridade_comercial = 2
-        situacao_comercial = "somente_preco"
+        prioridade = 2
+        situacao = "somente_preco"
     elif tem_estoque:
-        prioridade_comercial = 1
-        situacao_comercial = "somente_estoque"
+        prioridade = 1
+        situacao = "somente_estoque"
     else:
-        prioridade_comercial = 0
-        situacao_comercial = "sem_preco_e_sem_estoque"
+        prioridade = 0
+        situacao = "sem_preco_e_sem_estoque"
 
     return (
         {
             **item,
-            "sku": primeiro_valor_definido(
-                detalhe.get("sku"),
-                item.get("sku"),
-            ),
-            "descricao": primeiro_valor_definido(
-                detalhe.get("descricao"),
-                item.get("descricao"),
-            ),
-            "unidade": primeiro_valor_definido(
-                detalhe.get("unidade"),
-                item.get("unidade"),
-            ),
-            "gtin": primeiro_valor_definido(
-                detalhe.get("gtin"),
-                item.get("gtin"),
-            ),
             "preco": preco,
             "preco_promocional": preco_promocional,
             "preco_efetivo": preco_efetivo,
             "preco_disponivel": tem_preco,
             "tem_estoque": tem_estoque,
-            "prioridade_comercial": prioridade_comercial,
-            "situacao_comercial": situacao_comercial,
+            "prioridade_comercial": prioridade,
+            "situacao_comercial": situacao,
             "estoque": {
                 "saldo": saldo,
                 "reservado": reservado,
                 "disponivel": disponivel,
-                "localizacao": primeiro_valor_definido(
-                    estoque.get("localizacao"),
-                    item.get("localizacao"),
+                "localizacao": (
+                    estoque.get("localizacao")
+                    or item.get("localizacao")
                 ),
                 "status": (
                     "disponivel"
@@ -1200,42 +1480,8 @@ def enriquecer_produto_olist(
                 "depositos": estoque.get("depositos") or [],
             },
         },
-        limites_olist,
+        limites,
     )
-
-
-def listar_produtos_por_palavra_olist(
-    consulta: str,
-    max_paginas: int = 3,
-) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    itens: list[dict[str, Any]] = []
-    limites_olist: dict[str, str] = {}
-    offset = 0
-    limite_pagina = 100
-
-    for _ in range(max_paginas):
-        parametros: dict[str, Any] = {
-            "nome": consulta,
-            "situacao": "A",
-            "limit": limite_pagina,
-            "offset": offset,
-        }
-
-        retorno, limites_olist = requisicao_get_olist(
-            "produtos",
-            parametros,
-        )
-        pagina_itens = retorno.get("itens") or []
-        itens.extend(pagina_itens)
-
-        paginacao = retorno.get("paginacao") or {}
-        total = int(paginacao.get("total") or len(itens))
-        offset += limite_pagina
-
-        if not pagina_itens or offset >= total:
-            break
-
-    return itens, limites_olist
 
 
 def pesquisar_produtos_olist(
@@ -1245,144 +1491,58 @@ def pesquisar_produtos_olist(
     modelo: str | None,
     limite: int,
 ) -> dict[str, Any]:
-    consultas = montar_consultas_olist(
+    inicio = time_module.perf_counter()
+    candidatos, catalogo_info = buscar_candidatos_catalogo(
         termo,
         produto,
         marca,
         modelo,
     )
-    if not consultas:
-        raise HTTPException(
-            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                "Informe termo ou os campos produto, marca e modelo."
-            ),
+
+    avaliados: list[dict[str, Any]] = []
+    for item in candidatos:
+        correspondencia = avaliar_correspondencia_catalogo(
+            item,
+            termo,
+            produto,
+            marca,
+            modelo,
         )
+        if not correspondencia["correspondencia_palavras"]:
+            continue
 
-    inicio = time_module.perf_counter()
-    candidatos: dict[int, dict[str, Any]] = {}
-    limites_olist: dict[str, str] = {}
-    consultas_executadas: list[str] = []
-
-    for indice, consulta in enumerate(consultas):
-        consultas_executadas.append(consulta)
-
-        # A primeira consulta normalmente é o número do modelo e é bastante
-        # seletiva. Consultas mais genéricas usam menos páginas para proteger
-        # o limite oficial de requisições.
-        max_paginas = 3 if indice == 0 else 1
-        itens, limites_olist = listar_produtos_por_palavra_olist(
-            consulta,
-            max_paginas=max_paginas,
-        )
-
-        for item in itens:
-            produto_id = item.get("id")
-            if produto_id is None:
-                continue
-
-            correspondencia = avaliar_correspondencia_produto(
-                item,
-                termo,
-                produto,
-                marca,
-                modelo,
-            )
-            item_normalizado = {
-                "id": int(produto_id),
-                "sku": item.get("sku"),
-                "descricao": item.get("descricao"),
-                "unidade": item.get("unidade"),
-                "gtin": item.get("gtin"),
-                "localizacao": (
-                    item.get("estoque") or {}
-                ).get("localizacao"),
-                "preco": (
-                    item.get("precos") or {}
-                ).get("preco"),
-                "preco_promocional": (
-                    item.get("precos") or {}
-                ).get("precoPromocional"),
+        avaliados.append(
+            {
+                **item,
                 "pontuacao": correspondencia["pontuacao"],
                 "correspondencia": correspondencia,
-                "consultas_origem": [consulta],
             }
+        )
 
-            atual = candidatos.get(int(produto_id))
-            if atual is None:
-                candidatos[int(produto_id)] = item_normalizado
-            else:
-                if (
-                    correspondencia["pontuacao"]
-                    > atual["pontuacao"]
-                ):
-                    item_normalizado["consultas_origem"] = (
-                        atual["consultas_origem"]
-                        + [consulta]
-                    )
-                    candidatos[int(produto_id)] = item_normalizado
-                elif consulta not in atual["consultas_origem"]:
-                    atual["consultas_origem"].append(consulta)
-
-        # Se a busca pelo número e pelas combinações específicas já encontrou
-        # opções compatíveis, não é necessário executar a pesquisa final
-        # extremamente genérica apenas pelo nome da peça.
-        compativeis = [
-            item
-            for item in candidatos.values()
-            if item["correspondencia"][
-                "correspondencia_palavras"
-            ]
-        ]
-        if len(consultas_executadas) >= 4 and compativeis:
-            break
-
-    compativeis = [
-        item
-        for item in candidatos.values()
-        if item["correspondencia"][
-            "correspondencia_palavras"
-        ]
-    ]
-
-    aproximados = [
-        item
-        for item in candidatos.values()
-        if not item["correspondencia"][
-            "correspondencia_palavras"
-        ]
-        and item["correspondencia"][
-            "produto_corresponde"
-        ]
-        and item["correspondencia"][
-            "modelo_corresponde"
-        ]
-    ]
-
-    base_enriquecimento = sorted(
-        compativeis,
+    avaliados.sort(
         key=lambda item: (
             item["pontuacao"],
+            item.get("preco_disponivel") or False,
             normalizar_texto_busca(item["descricao"]),
         ),
         reverse=True,
-    )[:max(limite * 2, 10)]
+    )
 
+    # Consulta estoque somente dos candidatos realmente compatíveis.
+    # A margem permite ordenar por disponibilidade antes de cortar o limite.
+    candidatos_estoque = avaliados[:max(limite * 3, 10)]
     resultados_enriquecidos: list[dict[str, Any]] = []
+    limites_olist: dict[str, str] = {}
 
-    for item in base_enriquecimento:
-        enriquecido, limites_olist = enriquecer_produto_olist(
-            item
+    for item in candidatos_estoque:
+        enriquecido, limites_olist = (
+            enriquecer_estoque_catalogo(item)
         )
         resultados_enriquecidos.append(enriquecido)
+        aguardar_rate_limit_olist(limites_olist)
 
-    # Compatibilidade vem antes da prioridade comercial. Entre produtos
-    # compatíveis, itens com preço e estoque aparecem primeiro.
     resultados_enriquecidos.sort(
         key=lambda item: (
-            item["correspondencia"][
-                "correspondencia_palavras"
-            ],
             item["prioridade_comercial"],
             item["pontuacao"],
             item["estoque"]["disponivel"] or 0,
@@ -1390,19 +1550,14 @@ def pesquisar_produtos_olist(
         ),
         reverse=True,
     )
-
     resultados = resultados_enriquecidos[:limite]
 
-    if len(resultados) == 1:
-        status_resultado = "encontrado"
-    elif len(resultados) > 1:
-        status_resultado = "multiplos_resultados"
-    else:
+    if len(resultados) == 0:
         status_resultado = "nao_encontrado"
-
-    duracao_ms = int(
-        (time_module.perf_counter() - inicio) * 1000
-    )
+    elif len(resultados) == 1:
+        status_resultado = "encontrado"
+    else:
+        status_resultado = "multiplos_resultados"
 
     return {
         "status": status_resultado,
@@ -1411,24 +1566,23 @@ def pesquisar_produtos_olist(
             "produto": produto,
             "marca": marca,
             "modelo": modelo,
-            "modo_busca": "palavras_na_descricao",
+            "modo_busca": (
+                "catalogo_local_palavras_na_descricao"
+            ),
             "ordenacao": (
                 "compatibilidade, preço+estoque, relevância"
             ),
-            "consultas_planejadas": consultas,
-            "consultas_executadas": consultas_executadas,
-            "id_lista_preco": (
-                int(OLIST_ID_LISTA_PRECO)
-                if OLIST_ID_LISTA_PRECO.isdigit()
-                else None
-            ),
+            **catalogo_info,
         },
         "quantidade_resultados": len(resultados),
-        "quantidade_compativeis_localizados": len(compativeis),
-        "quantidade_aproximados_descartados": len(aproximados),
+        "quantidade_compativeis_localizados": len(avaliados),
         "resultados": resultados,
         "rate_limit": limites_olist,
-        "duracao_ms": duracao_ms,
+        "duracao_ms": int(
+            (
+                time_module.perf_counter() - inicio
+            ) * 1000
+        ),
     }
 
 
@@ -1741,7 +1895,9 @@ async def lifespan(app: FastAPI):
                     to_regclass('comercial.configuracoes') AS tabela_configuracoes,
                     to_regclass('comercial.olist_oauth_tokens') AS tabela_olist_tokens,
                     to_regclass('comercial.olist_oauth_states') AS tabela_olist_states,
-                    to_regclass('comercial.consultas_olist') AS tabela_consultas_olist;
+                    to_regclass('comercial.consultas_olist') AS tabela_consultas_olist,
+                    to_regclass('comercial.olist_catalogo_produtos') AS tabela_catalogo_olist,
+                    to_regclass('comercial.olist_catalogo_sincronizacoes') AS tabela_catalogo_sync;
                 """
             )
             resultado = cursor.fetchone()
@@ -1762,6 +1918,8 @@ async def lifespan(app: FastAPI):
                 resultado["tabela_olist_tokens"],
                 resultado["tabela_olist_states"],
                 resultado["tabela_consultas_olist"],
+                resultado["tabela_catalogo_olist"],
+                resultado["tabela_catalogo_sync"],
             ]
 
             if any(tabela is None for tabela in tabelas):
@@ -1775,7 +1933,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RBK Vendedor IA API",
     description="API comercial do projeto piloto RBK Vendedor IA.",
-    version="0.8.2",
+    version="0.9.0",
     lifespan=lifespan,
 )
 
@@ -1786,7 +1944,7 @@ def saude() -> dict[str, str]:
         "status": "ok",
         "servico": "api-comercial",
         "projeto": "RBK Vendedor IA",
-        "versao": "0.8.2",
+        "versao": "0.9.0",
     }
 
 
@@ -1992,6 +2150,120 @@ def callback_oauth_olist(
         ),
         media_type="text/html",
     )
+
+
+@app.post(
+    "/olist/catalogo/sincronizar",
+    tags=["Olist"],
+    dependencies=[Depends(validar_api_key)],
+)
+def sincronizar_catalogo(
+    max_paginas: int = Query(
+        default=200,
+        ge=1,
+        le=1000,
+    ),
+) -> dict[str, Any]:
+    return sincronizar_catalogo_olist(max_paginas)
+
+
+@app.get(
+    "/olist/catalogo/status",
+    tags=["Olist"],
+    dependencies=[Depends(validar_api_key)],
+)
+def status_catalogo_olist() -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER (
+                        WHERE ativo = TRUE
+                    ) AS produtos_ativos,
+                    COUNT(*) FILTER (
+                        WHERE ativo = TRUE
+                          AND preco_disponivel = TRUE
+                    ) AS produtos_com_preco,
+                    MAX(sincronizado_em) FILTER (
+                        WHERE ativo = TRUE
+                    ) AS ultima_atualizacao
+                FROM comercial.olist_catalogo_produtos;
+                """
+            )
+            resumo = cursor.fetchone()
+
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    status,
+                    inicio_em,
+                    fim_em,
+                    paginas,
+                    total_informado_olist,
+                    total_recebido,
+                    total_gravado,
+                    duracao_ms,
+                    erro,
+                    rate_limit
+                FROM comercial.olist_catalogo_sincronizacoes
+                ORDER BY inicio_em DESC
+                LIMIT 1;
+                """
+            )
+            ultima = cursor.fetchone()
+
+    return {
+        **resumo,
+        "ultima_sincronizacao": ultima,
+    }
+
+
+@app.get(
+    "/olist/catalogo/produto/{codigo}",
+    tags=["Olist"],
+    dependencies=[Depends(validar_api_key)],
+)
+def obter_produto_catalogo_por_codigo(
+    codigo: str,
+) -> dict[str, Any]:
+    codigo_limpo = codigo.strip()
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id_olist AS id,
+                    sku,
+                    descricao,
+                    unidade,
+                    gtin,
+                    preco,
+                    preco_promocional,
+                    preco_efetivo,
+                    preco_disponivel,
+                    localizacao,
+                    ativo,
+                    sincronizado_em
+                FROM comercial.olist_catalogo_produtos
+                WHERE sku = %s
+                   OR id_olist::text = %s
+                ORDER BY ativo DESC
+                LIMIT 1;
+                """,
+                (codigo_limpo, codigo_limpo),
+            )
+            produto_catalogo = cursor.fetchone()
+
+    if produto_catalogo is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Produto não localizado no catálogo sincronizado.",
+        )
+
+    return produto_catalogo
 
 
 @app.get(
