@@ -1,37 +1,46 @@
-# RBK Vendedor IA API v0.8.0
+# RBK Vendedor IA API v0.8.2
 
-Etapa 28A: conexão OAuth V3 com o Olist e pesquisa real de produtos.
+A pesquisa de produtos passa a seguir a lógica operacional do ERP Olist:
+palavras e números são procurados na descrição, sem exigir a mesma ordem.
 
-## Endpoints novos
+## Exemplo
 
-- `GET /olist/status`
-- `POST /olist/oauth/iniciar`
-- `GET /olist/oauth/callback`
-- `GET /olist/produtos/pesquisar`
+Pesquisa:
 
-## Segurança
+```text
+carburador stihl ms 170
+```
 
-- Client ID e Client Secret permanecem nas variáveis do Easypanel.
-- Access token e refresh token são criptografados no PostgreSQL com
-  `pgcrypto`.
-- O callback OAuth valida um `state` de uso único com validade de 15 minutos.
-- A resposta pública de produtos não expõe preço de custo.
+Resultados compatíveis esperados:
 
-## Busca
+```text
+CARBURADOR PARA MOTOSSERRA STIHL MS 170/180
+CARBURADOR ST-170 NOVA 2MIX
+```
 
-A pesquisa usa combinações progressivas de:
+Produtos de modelos diferentes, como MS 461 ou MS 311, são descartados.
 
-- termo completo;
-- peça + marca + modelo;
-- peça + modelo;
-- modelo;
-- peça.
+## Ordenação
 
-Os resultados são ranqueados localmente e os principais recebem consulta de
-estoque no endpoint oficial `/estoque/{idProduto}`.
+A segurança da aplicação vem primeiro. Entre produtos compatíveis:
 
-## Limite desta etapa
+1. produto com preço e estoque disponível;
+2. produto com preço, mas sem estoque;
+3. produto com estoque, mas sem preço;
+4. produto sem preço e sem estoque.
 
-A API já consulta produto, preço de venda e estoque. O ramal 605 ainda não
-chama essa pesquisa durante a ligação. Essa conexão será feita na Etapa 28B,
-depois da validação manual do endpoint.
+## Campos novos no retorno
+
+- `situacao_comercial`;
+- `prioridade_comercial`;
+- `preco_disponivel`;
+- `tem_estoque`;
+- `modo_busca`;
+- palavras e números encontrados;
+- depósitos retornados pelo estoque.
+
+## Observação
+
+A API não utiliza `idListaPreco` como filtro automático, porque esse filtro
+eliminaria produtos que ainda não possuem preço na lista. Esses produtos
+devem continuar aparecendo depois das opções comercializáveis.
