@@ -371,7 +371,7 @@ def solicitar_token_olist(
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.9.2",
+            "User-Agent": "RBK-Vendedor-IA-API/0.9.3",
         },
     )
 
@@ -609,7 +609,7 @@ def requisicao_get_olist(
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.9.2",
+            "User-Agent": "RBK-Vendedor-IA-API/0.9.3",
         },
     )
 
@@ -1178,26 +1178,120 @@ def sincronizar_catalogo_olist(
         raise
 
 
-def tokens_adicionais_termo(
+MATERIAIS_BUSCA_BASE = {
+    "malha",
+    "latex",
+    "raspa",
+    "vaqueta",
+    "nitrilica",
+    "nitrilo",
+    "nylon",
+    "couro",
+    "algodao",
+    "pvc",
+}
+
+PREFIXOS_MODELO_NAO_OBRIGATORIOS = {
+    "ms",
+    "fs",
+    "st",
+    "hq",
+}
+
+
+def palavra_chave_contida(
+    descricao_normalizada: str,
+    palavra: str,
+) -> bool:
+    palavra_normalizada = normalizar_texto_busca(palavra)
+    if not palavra_normalizada:
+        return True
+
+    if palavra_normalizada in descricao_normalizada:
+        return True
+
+    descricao_compacta = descricao_normalizada.replace(" ", "")
+    palavra_compacta = palavra_normalizada.replace(" ", "")
+    return bool(
+        palavra_compacta
+        and palavra_compacta in descricao_compacta
+    )
+
+
+def identificar_palavras_chave_busca(
     termo: str | None,
     produto: str | None,
     marca: str | None,
     modelo: str | None,
-) -> list[str]:
-    termo_tokens = set(tokens_busca(termo))
-    representados = set(tokens_busca(produto))
-    representados.update(tokens_busca(marca))
-    representados.update(aliases_marca(marca))
+) -> dict[str, list[str]]:
+    termo_tokens = tokens_busca(termo)
+    produto_tokens = tokens_busca(produto)
+    marca_tokens = set(tokens_busca(marca))
+    marca_tokens.update(aliases_marca(marca))
 
     modelo_partes = componentes_modelo(modelo)
-    representados.update(modelo_partes["prefixos"])
-    representados.update(modelo_partes["numeros"])
+    numeros_modelo = sorted(modelo_partes["numeros"])
+    prefixos_modelo = set(modelo_partes["prefixos"])
 
-    return sorted(
-        token
-        for token in termo_tokens
-        if token not in representados
-    )
+    obrigatorias: list[str] = []
+    vistas: set[str] = set()
+
+    def adicionar_obrigatoria(valor: str) -> None:
+        chave = normalizar_texto_busca(valor)
+        if chave and chave not in vistas:
+            vistas.add(chave)
+            obrigatorias.append(chave)
+
+    for token in produto_tokens:
+        adicionar_obrigatoria(token)
+
+    for numero in numeros_modelo:
+        adicionar_obrigatoria(numero)
+
+    # Números, medidas e cilindradas digitados pelo cliente funcionam como
+    # palavras-chave do Olist: 170, 160, 43cc, 35cm etc.
+    for token in termo_tokens:
+        if any(caractere.isdigit() for caractere in token):
+            adicionar_obrigatoria(token)
+
+    # Quando o produto é amplo, o material é uma palavra-base útil.
+    # Ex.: "luva malha", "luva raspa", "luva latex".
+    if len(produto_tokens) <= 1:
+        for token in termo_tokens:
+            if token in MATERIAIS_BUSCA_BASE:
+                adicionar_obrigatoria(token)
+
+    # Se o LLM não separou o produto, usa as duas primeiras palavras úteis
+    # do pedido como busca-base.
+    if not obrigatorias:
+        for token in termo_tokens[:2]:
+            adicionar_obrigatoria(token)
+
+    representadas = set(obrigatorias)
+    representadas.update(marca_tokens)
+    representadas.update(prefixos_modelo)
+    representadas.update(PREFIXOS_MODELO_NAO_OBRIGATORIOS)
+
+    preferenciais: list[str] = []
+    preferencias_vistas: set[str] = set()
+
+    for token in termo_tokens:
+        chave = normalizar_texto_busca(token)
+        if (
+            not chave
+            or chave in representadas
+            or chave in preferencias_vistas
+        ):
+            continue
+
+        preferencias_vistas.add(chave)
+        preferenciais.append(chave)
+
+    return {
+        "obrigatorias": obrigatorias,
+        "preferenciais": preferenciais,
+        "aliases_marca": sorted(marca_tokens),
+    }
 
 
 def avaliar_correspondencia_catalogo(
@@ -1210,153 +1304,83 @@ def avaliar_correspondencia_catalogo(
     descricao = normalizar_texto_busca(
         item.get("descricao")
     )
-    tokens_base = set(
-        item.get("tokens")
-        or tokens_busca(descricao)
-    )
-    numeros_base = set(re.findall(r"\d+", descricao))
+    tokens_descricao = set(descricao.split())
 
-    produto_tokens = tokens_busca(produto)
-    marca_solicitada = normalizar_texto_busca(marca)
-    marca_aliases = aliases_marca(marca)
-    modelo_partes = componentes_modelo(modelo)
-    numeros_modelo = modelo_partes["numeros"]
-    prefixos_modelo = modelo_partes["prefixos"]
-    tokens_adicionais = tokens_adicionais_termo(
+    palavras = identificar_palavras_chave_busca(
         termo,
         produto,
         marca,
         modelo,
     )
+    obrigatorias = palavras["obrigatorias"]
+    preferenciais = palavras["preferenciais"]
+    aliases = palavras["aliases_marca"]
 
-    produto_ok = bool(
-        not produto_tokens
-        or all(
-            token in tokens_base
-            for token in produto_tokens
-        )
+    obrigatorias_encontradas = [
+        palavra
+        for palavra in obrigatorias
+        if palavra_chave_contida(descricao, palavra)
+    ]
+    base_corresponde = bool(
+        obrigatorias
+        and len(obrigatorias_encontradas)
+        == len(obrigatorias)
     )
 
-    marca_literal = bool(
-        marca_solicitada
-        and marca_solicitada in tokens_base
-    )
-    aliases_encontrados = sorted(
+    preferenciais_encontradas = [
+        palavra
+        for palavra in preferenciais
+        if palavra_chave_contida(descricao, palavra)
+    ]
+
+    aliases_encontrados = [
         alias
-        for alias in marca_aliases
-        if alias in tokens_base
-    )
-    marca_ok = bool(
-        not marca_aliases
-        or marca_literal
-        or aliases_encontrados
+        for alias in aliases
+        if alias in tokens_descricao
+    ]
+    marca_corresponde = bool(
+        not aliases or aliases_encontrados
     )
 
-    numeros_encontrados = sorted(
-        numero
-        for numero in numeros_modelo
-        if numero in numeros_base
-    )
-    numero_ok = bool(
-        not numeros_modelo
-        or len(numeros_encontrados)
-        == len(numeros_modelo)
+    produto_normalizado = normalizar_texto_busca(produto)
+    frase_produto_corresponde = bool(
+        produto_normalizado
+        and produto_normalizado in descricao
     )
 
-    prefixos_encontrados = sorted(
-        prefixo
-        for prefixo in prefixos_modelo
-        if prefixo in tokens_base
+    pontuacao_preferencias = len(
+        preferenciais_encontradas
     )
-    prefixo_literal_ok = bool(
-        not prefixos_modelo
-        or len(prefixos_encontrados)
-        == len(prefixos_modelo)
+    pontuacao_relevancia = (
+        len(obrigatorias_encontradas) * 100
+        + pontuacao_preferencias * 40
+        + (30 if aliases_encontrados else 0)
+        + (20 if frase_produto_corresponde else 0)
     )
-    stihl_alias_ok = bool(
-        marca_solicitada == "stihl"
-        and "st" in tokens_base
-        and numero_ok
-    )
-    prefixo_ok = bool(
-        prefixo_literal_ok or stihl_alias_ok
-    )
-
-    adicionais_encontrados = sorted(
-        token
-        for token in tokens_adicionais
-        if token in tokens_base
-    )
-    adicionais_ok = bool(
-        not tokens_adicionais
-        or len(adicionais_encontrados)
-        == len(tokens_adicionais)
-    )
-
-    termo_tokens = tokens_busca(termo)
-    termo_encontrados = sorted(
-        token
-        for token in termo_tokens
-        if token in tokens_base
-    )
-
-    compatibilidade = bool(
-        produto_ok
-        and marca_ok
-        and numero_ok
-        and prefixo_ok
-        and adicionais_ok
-    )
-
-    pontuacao = 0
-    if produto_ok:
-        pontuacao += 100
-    if marca_literal:
-        pontuacao += 90
-    elif aliases_encontrados:
-        pontuacao += 70
-    if numero_ok:
-        pontuacao += 180
-    if prefixo_literal_ok and prefixos_modelo:
-        pontuacao += 60
-    elif stihl_alias_ok:
-        pontuacao += 40
-    if adicionais_ok and tokens_adicionais:
-        pontuacao += 140
-    if termo_tokens:
-        pontuacao += int(
-            80
-            * len(termo_encontrados)
-            / max(len(termo_tokens), 1)
-        )
-    if compatibilidade:
-        pontuacao += 250
 
     return {
-        "pontuacao": pontuacao,
-        "correspondencia_exata": compatibilidade,
-        "correspondencia_palavras": compatibilidade,
-        "produto_corresponde": produto_ok,
-        "marca_corresponde": marca_ok,
-        "modelo_corresponde": bool(
-            numero_ok and prefixo_ok
+        "pontuacao": pontuacao_relevancia,
+        "pontuacao_relevancia": pontuacao_relevancia,
+        "correspondencia_exata": base_corresponde,
+        "correspondencia_palavras": base_corresponde,
+        "produto_corresponde": base_corresponde,
+        "marca_corresponde": marca_corresponde,
+        "modelo_corresponde": True,
+        "palavras_chave_obrigatorias": obrigatorias,
+        "palavras_chave_encontradas": (
+            obrigatorias_encontradas
         ),
-        "descricao_adicional_corresponde": adicionais_ok,
-        "marca_aliases_encontrados": (
-            aliases_encontrados
+        "palavras_preferenciais": preferenciais,
+        "palavras_preferenciais_encontradas": (
+            preferenciais_encontradas
         ),
-        "numeros_modelo_encontrados": (
-            numeros_encontrados
+        "quantidade_preferenciais": len(preferenciais),
+        "quantidade_preferenciais_encontradas": (
+            pontuacao_preferencias
         ),
-        "prefixos_modelo_encontrados": (
-            prefixos_encontrados
-        ),
-        "palavras_adicionais_exigidas": tokens_adicionais,
-        "palavras_adicionais_encontradas": (
-            adicionais_encontrados
-        ),
-        "palavras_termo_encontradas": (
-            termo_encontrados
+        "marca_aliases_encontrados": aliases_encontrados,
+        "frase_produto_corresponde": (
+            frase_produto_corresponde
         ),
     }
 
@@ -1366,29 +1390,28 @@ def buscar_candidatos_catalogo(
     produto: str | None,
     marca: str | None,
     modelo: str | None,
-    limite_candidatos: int = 250,
+    limite_candidatos: int = 2000,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    produto_tokens = tokens_busca(produto)
-    modelo_partes = componentes_modelo(modelo)
-    numeros_modelo = sorted(modelo_partes["numeros"])
-    marca_tokens = sorted(aliases_marca(marca))
-    adicionais = tokens_adicionais_termo(
+    palavras = identificar_palavras_chave_busca(
         termo,
         produto,
         marca,
         modelo,
     )
+    obrigatorias = palavras["obrigatorias"]
 
-    obrigatorios = sorted(
-        set(
-            produto_tokens
-            + numeros_modelo
-            + adicionais
+    if not obrigatorias:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Não foi possível extrair palavras-chave "
+                "para pesquisar o catálogo."
+            ),
         )
-    )
 
-    if not obrigatorios and termo:
-        obrigatorios = tokens_busca(termo)
+    # A palavra mais longa reduz o volume inicial. As demais são validadas
+    # por substring em Python, reproduzindo o modo "palavras-chave" do ERP.
+    ancora = max(obrigatorias, key=len)
 
     with obter_conexao() as conexao:
         with conexao.cursor() as cursor:
@@ -1440,35 +1463,49 @@ def buscar_candidatos_catalogo(
                     sincronizado_em
                 FROM comercial.olist_catalogo_produtos
                 WHERE ativo = TRUE
-                  AND (
-                      cardinality(%s::text[]) = 0
-                      OR tokens @> %s::text[]
-                  )
-                  AND (
-                      cardinality(%s::text[]) = 0
-                      OR tokens && %s::text[]
-                  )
+                  AND descricao_normalizada LIKE %s
                 ORDER BY
                     preco_disponivel DESC,
                     descricao
                 LIMIT %s;
                 """,
                 (
-                    obrigatorios,
-                    obrigatorios,
-                    marca_tokens,
-                    marca_tokens,
+                    f"%{ancora}%",
                     limite_candidatos,
                 ),
             )
-            candidatos = cursor.fetchall()
+            candidatos_iniciais = cursor.fetchall()
+
+    candidatos = [
+        item
+        for item in candidatos_iniciais
+        if all(
+            palavra_chave_contida(
+                item["descricao_normalizada"],
+                palavra,
+            )
+            for palavra in obrigatorias
+        )
+    ]
 
     return candidatos, {
         "total_catalogo_ativo": total_catalogo,
         "catalogo_sincronizado_em": sincronizado_em,
-        "tokens_obrigatorios": obrigatorios,
-        "palavras_adicionais": adicionais,
-        "aliases_marca": marca_tokens,
+        "modo_correspondencia": (
+            "todas_as_palavras_base_como_substring"
+        ),
+        "palavra_ancora": ancora,
+        "palavras_chave_obrigatorias": obrigatorias,
+        "palavras_preferenciais": palavras[
+            "preferenciais"
+        ],
+        "aliases_marca": palavras["aliases_marca"],
+        "quantidade_candidatos_iniciais": len(
+            candidatos_iniciais
+        ),
+        "quantidade_candidatos_filtrados": len(
+            candidatos
+        ),
     }
 
 
@@ -1574,6 +1611,7 @@ def pesquisar_produtos_olist(
     )
 
     avaliados: list[dict[str, Any]] = []
+
     for item in candidatos:
         correspondencia = avaliar_correspondencia_catalogo(
             item,
@@ -1588,23 +1626,77 @@ def pesquisar_produtos_olist(
         avaliados.append(
             {
                 **item,
-                "pontuacao": correspondencia["pontuacao"],
+                "pontuacao": correspondencia[
+                    "pontuacao_relevancia"
+                ],
                 "correspondencia": correspondencia,
             }
         )
 
+    if avaliados:
+        melhor_chave = max(
+            (
+                item["correspondencia"][
+                    "quantidade_preferenciais_encontradas"
+                ],
+                bool(
+                    item["correspondencia"][
+                        "marca_aliases_encontrados"
+                    ]
+                ),
+                item["correspondencia"][
+                    "pontuacao_relevancia"
+                ],
+            )
+            for item in avaliados
+        )
+    else:
+        melhor_chave = None
+
+    for item in avaliados:
+        chave_item = (
+            item["correspondencia"][
+                "quantidade_preferenciais_encontradas"
+            ],
+            bool(
+                item["correspondencia"][
+                    "marca_aliases_encontrados"
+                ]
+            ),
+            item["correspondencia"][
+                "pontuacao_relevancia"
+            ],
+        )
+        item["melhor_correspondencia"] = bool(
+            melhor_chave is not None
+            and chave_item == melhor_chave
+        )
+
     avaliados.sort(
         key=lambda item: (
-            item["pontuacao"],
+            item["melhor_correspondencia"],
+            item["correspondencia"][
+                "quantidade_preferenciais_encontradas"
+            ],
+            bool(
+                item["correspondencia"][
+                    "marca_aliases_encontrados"
+                ]
+            ),
             item.get("preco_disponivel") or False,
+            item["pontuacao"],
             normalizar_texto_busca(item["descricao"]),
         ),
         reverse=True,
     )
 
-    # Consulta estoque somente dos candidatos realmente compatíveis.
-    # A margem permite ordenar por disponibilidade antes de cortar o limite.
-    candidatos_estoque = avaliados[:max(limite * 3, 10)]
+    # O estoque é consultado somente para os candidatos mais relevantes.
+    quantidade_enriquecer = min(
+        max(limite * 2, 8),
+        12,
+    )
+    candidatos_estoque = avaliados[:quantidade_enriquecer]
+
     resultados_enriquecidos: list[dict[str, Any]] = []
     limites_olist: dict[str, str] = {}
 
@@ -1615,8 +1707,19 @@ def pesquisar_produtos_olist(
         resultados_enriquecidos.append(enriquecido)
         aguardar_rate_limit_olist(limites_olist)
 
+    # Relevância vem antes da disponibilidade. Assim, uma luva preta não
+    # substitui uma luva branca apenas porque existe em estoque.
     resultados_enriquecidos.sort(
         key=lambda item: (
+            item["melhor_correspondencia"],
+            item["correspondencia"][
+                "quantidade_preferenciais_encontradas"
+            ],
+            bool(
+                item["correspondencia"][
+                    "marca_aliases_encontrados"
+                ]
+            ),
             item["prioridade_comercial"],
             item["pontuacao"],
             item["estoque"]["disponivel"] or 0,
@@ -1624,6 +1727,7 @@ def pesquisar_produtos_olist(
         ),
         reverse=True,
     )
+
     resultados = resultados_enriquecidos[:limite]
 
     if len(resultados) == 0:
@@ -1633,6 +1737,12 @@ def pesquisar_produtos_olist(
     else:
         status_resultado = "multiplos_resultados"
 
+    quantidade_melhores = sum(
+        1
+        for item in avaliados
+        if item["melhor_correspondencia"]
+    )
+
     return {
         "status": status_resultado,
         "consulta": {
@@ -1641,15 +1751,18 @@ def pesquisar_produtos_olist(
             "marca": marca,
             "modelo": modelo,
             "modo_busca": (
-                "catalogo_local_palavras_na_descricao"
+                "palavras_chave_olist_substring"
             ),
             "ordenacao": (
-                "compatibilidade, preço+estoque, relevância"
+                "melhor_correspondencia, preço+estoque, relevância"
             ),
             **catalogo_info,
         },
         "quantidade_resultados": len(resultados),
         "quantidade_compativeis_localizados": len(avaliados),
+        "quantidade_melhor_correspondencia": (
+            quantidade_melhores
+        ),
         "resultados": resultados,
         "rate_limit": limites_olist,
         "duracao_ms": int(
@@ -2030,7 +2143,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RBK Vendedor IA API",
     description="API comercial do projeto piloto RBK Vendedor IA.",
-    version="0.9.2",
+    version="0.9.3",
     lifespan=lifespan,
 )
 
@@ -2041,7 +2154,7 @@ def saude() -> dict[str, str]:
         "status": "ok",
         "servico": "api-comercial",
         "projeto": "RBK Vendedor IA",
-        "versao": "0.9.2",
+        "versao": "0.9.3",
     }
 
 

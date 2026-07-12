@@ -1,42 +1,24 @@
-# RBK Vendedor IA API v0.9.2
+# RBK Vendedor IA API v0.9.3
 
-Esta versão amplia a pesquisa do catálogo e cria uma fila real de vendas
-futuras para revisão humana ou pelo futuro agente gerente.
+A busca local passa a reproduzir o modo **palavras-chave** do Olist.
 
-## Busca flexível
+## Regra
 
-A pesquisa não depende mais de marca e modelo. O termo completo pode conter:
+- todas as palavras-base precisam aparecer em qualquer posição da descrição;
+- a comparação é por substring;
+- `160` também encontra `FS160`, `GX160` e `1600`, como no ERP;
+- características restantes são usadas para relevância;
+- relevância vem antes de preço e estoque;
+- preço e estoque ordenam produtos com a mesma correspondência.
 
-- produto;
-- material;
-- cor;
-- tipo;
-- aplicação;
-- características;
-- números e referências.
+## Exemplos de palavras-base
 
-Exemplos:
+- cinto de sustentação universal laranja → `cinto sustentacao`;
+- luva de malha pigmentada branca → `luva malha`;
+- embreagem para MS 382 → `embreagem 382`;
+- sabre para MS 170 → `sabre 170`;
+- pistão para FS 160 → `pistao 160`;
+- carburador 43cc → `carburador 43cc`.
 
-- cinto de sustentação para roçadeira universal laranja;
-- luva de malha pigmentada branca;
-- embreagem para MS 170.
-
-As palavras adicionais do pedido passam a ser obrigatórias na descrição do
-produto, enquanto marca e modelo continuam aceitando aliases como Stihl/ST.
-
-## Venda futura
-
-Quando a chamada termina sem venda imediata por falta de preço, estoque,
-produto ou integração, a API cria automaticamente:
-
-- uma oportunidade;
-- uma pendência comercial;
-- uma interação de sistema;
-- uma próxima ação para retorno.
-
-A fila pode ser consultada em:
-
-- `GET /pendencias-comerciais`
-- `PATCH /pendencias-comerciais/{id}`
-
-O futuro agente gerente poderá consumir essa mesma fila.
+O prefixo MS/FS não é obrigatório, pois os cadastros podem usar ST, apenas
+o número ou outras abreviações.
