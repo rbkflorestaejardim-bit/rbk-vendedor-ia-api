@@ -432,7 +432,7 @@
     <section class="card col-12">
       <h2>Prévia das ofertas do Carlos</h2>
       <p class="subtitulo">
-        Mostra de 3 a 12 produtos ativos, com preço e estoque disponíveis.
+        Mostra de 3 a 12 produtos ativos com preço de venda. Estoque zerado não impede a oferta.
       </p>
       <div class="linha-botoes" style="margin-bottom:14px">
         <select id="quantidadeOferta" style="width:190px">
@@ -765,7 +765,7 @@
 
       if (!dados.ofertas.length) {
         area.innerHTML =
-          "<div class='rodape-info'>Nenhum produto disponível para oferta.</div>";
+          "<div class='rodape-info'>Nenhum produto ativo do encarte possui preço de venda na Olist.</div>";
         return;
       }
 
@@ -779,9 +779,21 @@
         const detalhes = document.createElement("div");
         detalhes.className = "metricas";
         detalhes.style.marginTop = "7px";
+        const estoqueTexto =
+          oferta.estoque_disponivel === null ||
+          oferta.estoque_disponivel === undefined
+            ? "não consultado"
+            : oferta.estoque_disponivel;
+
+        const disponibilidadeTexto =
+          oferta.disponibilidade_comercial === "pronta_entrega"
+            ? "pronta entrega"
+            : "sob consulta";
+
         detalhes.textContent =
           "Oferta: " + moeda(oferta.preco_oferta) +
-          " | Estoque: " + oferta.estoque_disponivel +
+          " | Estoque: " + estoqueTexto +
+          " | Disponibilidade: " + disponibilidadeTexto +
           " | Prioridade: " + oferta.prioridade;
 
         const fala = document.createElement("div");

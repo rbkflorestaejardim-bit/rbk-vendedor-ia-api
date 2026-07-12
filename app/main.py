@@ -377,7 +377,7 @@ def solicitar_token_olist(
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.10.1",
+            "User-Agent": "RBK-Vendedor-IA-API/0.10.2",
         },
     )
 
@@ -615,7 +615,7 @@ def requisicao_get_olist(
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.10.1",
+            "User-Agent": "RBK-Vendedor-IA-API/0.10.2",
         },
     )
 
@@ -2376,7 +2376,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RBK Vendedor IA API",
     description="API comercial do projeto piloto RBK Vendedor IA.",
-    version="0.10.1",
+    version="0.10.2",
     lifespan=lifespan,
 )
 
@@ -2387,7 +2387,7 @@ def saude() -> dict[str, str]:
         "status": "ok",
         "servico": "api-comercial",
         "projeto": "RBK Vendedor IA",
-        "versao": "0.10.1",
+        "versao": "0.10.2",
     }
 
 
@@ -2877,6 +2877,8 @@ def selecionar_ofertas_encarte(
 
         verificados += 1
 
+        consulta_estoque_ok = True
+
         try:
             enriquecido, limites_olist = (
                 enriquecer_estoque_catalogo(
@@ -2884,7 +2886,17 @@ def selecionar_ofertas_encarte(
                 )
             )
         except Exception:
-            continue
+            consulta_estoque_ok = False
+            enriquecido = {
+                **candidato,
+                "estoque": {
+                    "saldo": None,
+                    "reservado": None,
+                    "disponivel": None,
+                    "status": "consulta_indisponivel",
+                    "depositos": [],
+                },
+            }
 
         preco_oferta = (
             normalizar_preco(
@@ -2904,12 +2916,35 @@ def selecionar_ofertas_encarte(
             ).get("disponivel")
         )
 
-        if (
-            preco_oferta is None
-            or disponivel is None
-            or disponivel <= 0
-        ):
+        # Regra comercial do encarte:
+        # produto ativo + preço de venda = produto ofertável.
+        # Estoque não bloqueia a oferta.
+        if preco_oferta is None or preco_oferta <= 0:
             continue
+
+        pronta_entrega = bool(
+            disponivel is not None
+            and disponivel > 0
+        )
+        disponibilidade_comercial = (
+            "pronta_entrega"
+            if pronta_entrega
+            else "sob_consulta"
+        )
+
+        if pronta_entrega:
+            mensagem_sugerida = (
+                f"Também temos {candidato['descricao']} "
+                f"por R$ {preco_oferta:.2f}. "
+                "Quer aproveitar e incluir algumas unidades?"
+            )
+        else:
+            mensagem_sugerida = (
+                f"Também temos {candidato['descricao']} "
+                f"por R$ {preco_oferta:.2f} no encarte. "
+                "Quer incluir algumas unidades no orçamento? "
+                "Eu verifico a disponibilidade para você."
+            )
 
         ofertas.append(
             {
@@ -2932,13 +2967,15 @@ def selecionar_ofertas_encarte(
                 "origem_preco": "olist",
                 "preco_editavel": False,
                 "estoque_disponivel": disponivel,
+                "consulta_estoque_ok": consulta_estoque_ok,
+                "disponibilidade_comercial": (
+                    disponibilidade_comercial
+                ),
                 "prioridade": candidato["prioridade"],
                 "observacao": candidato["observacao"],
                 "mensagem_sugerida": (
-                    f"Também temos {candidato['descricao']} "
-                    f"por R$ {preco_oferta:.2f}. "
-                    "Quer aproveitar e incluir algumas unidades?"
-                ).replace(".", ",", 1),
+                    mensagem_sugerida.replace(".", ",", 1)
+                ),
             }
         )
 
@@ -2957,6 +2994,18 @@ def selecionar_ofertas_encarte(
         "quantidade_solicitada": quantidade,
         "quantidade_retornada": len(ofertas),
         "quantidade_minima_atingida": len(ofertas) >= 3,
+        "quantidade_pronta_entrega": sum(
+            1
+            for oferta in ofertas
+            if oferta["disponibilidade_comercial"]
+            == "pronta_entrega"
+        ),
+        "quantidade_sob_consulta": sum(
+            1
+            for oferta in ofertas
+            if oferta["disponibilidade_comercial"]
+            == "sob_consulta"
+        ),
         "candidatos_verificados": verificados,
         "ofertas": ofertas,
         "rate_limit": limites_olist,
