@@ -1,30 +1,23 @@
-# RBK Vendedor IA API v0.9.0
+# RBK Vendedor IA API v0.9.1
 
-A pesquisa deixa de depender das limitações da busca remota por `nome` em
-cada atendimento. A API sincroniza todos os produtos ativos do Olist em um
-catálogo local no PostgreSQL e pesquisa por palavras e números diretamente
-nas descrições.
+Correção do erro HTTP 500 na pesquisa do catálogo Olist.
 
-## Fluxo
+## Causa
 
-1. `POST /olist/catalogo/sincronizar`
-2. A API pagina `GET /produtos` sem filtro de nome.
-3. Todos os produtos ativos são gravados localmente.
-4. `GET /olist/produtos/pesquisar` consulta o catálogo local.
-5. Apenas os produtos compatíveis recebem consulta de estoque em tempo real.
-6. Entre os compatíveis, preço e estoque determinam a ordem comercial.
+O resultado da pesquisa contém campos `datetime`, como:
 
-## Endpoints novos
+- `catalogo_sincronizado_em`;
+- `sincronizado_em` dos produtos.
 
-- `POST /olist/catalogo/sincronizar`
-- `GET /olist/catalogo/status`
-- `GET /olist/catalogo/produto/{codigo}`
+O FastAPI consegue devolver esses valores na resposta HTTP, mas o adaptador
+`Jsonb` do psycopg não serializa objetos `datetime` diretamente.
 
-## Resultado esperado
+## Correção
 
-Para `carburador + Stihl + MS 170`, o catálogo deve localizar tanto:
+Antes de gravar o histórico em `comercial.consultas_olist`, o resultado agora
+é convertido com `fastapi.encoders.jsonable_encoder`.
 
-- SKU 12933 — CARBURADOR PARA MOTOSSERRA STIHL MS 170/180
-- SKU 2452 — CARBURADOR ST-170 NOVA 2MIX
+Isso também protege a gravação contra UUID, Decimal, date e outros tipos
+compatíveis com respostas FastAPI, mas não nativos do JSON.
 
-O SKU 12933 deve vir primeiro quando mantiver preço e estoque disponíveis.
+Nenhuma alteração de SQL, gateway-voz, Asterisk ou PostgreSQL é necessária.

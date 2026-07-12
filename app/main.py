@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 
 import psycopg
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, Security, status as http_status
+from fastapi.encoders import jsonable_encoder
 from fastapi.security import APIKeyHeader
 from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
@@ -361,7 +362,7 @@ def solicitar_token_olist(
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.9.0",
+            "User-Agent": "RBK-Vendedor-IA-API/0.9.1",
         },
     )
 
@@ -599,7 +600,7 @@ def requisicao_get_olist(
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.9.0",
+            "User-Agent": "RBK-Vendedor-IA-API/0.9.1",
         },
     )
 
@@ -1933,7 +1934,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RBK Vendedor IA API",
     description="API comercial do projeto piloto RBK Vendedor IA.",
-    version="0.9.0",
+    version="0.9.1",
     lifespan=lifespan,
 )
 
@@ -1944,7 +1945,7 @@ def saude() -> dict[str, str]:
         "status": "ok",
         "servico": "api-comercial",
         "projeto": "RBK Vendedor IA",
-        "versao": "0.9.0",
+        "versao": "0.9.1",
     }
 
 
@@ -2336,7 +2337,7 @@ def pesquisar_produtos(
                     resultado["status"],
                     resultado["quantidade_resultados"],
                     resultado["duracao_ms"],
-                    Jsonb(resultado),
+                    Jsonb(jsonable_encoder(resultado)),
                 ),
             )
             consulta_id = cursor.fetchone()["id"]
