@@ -1,30 +1,15 @@
-# RBK Vendedor IA API v0.11.0
+# RBK Vendedor IA API v0.11.1
 
-## Etapa 31A — carrinho e orçamento de múltiplos itens
+## Correção do fluxo comercial
 
-A API passa a manter um rascunho de orçamento durante a conversa do Carlos.
+Itens que ficaram sem preço, não foram encontrados ou tiveram falha de
+consulta durante uma conversa agora são agrupados em uma pendência comercial,
+mesmo quando a chamada continua e outros produtos entram no orçamento.
 
-### Endpoints
-
-```text
-POST /orcamentos-ia/rascunho/itens
-GET  /orcamentos-ia/rascunho/{chamada_externa_id}
-POST /orcamentos-ia/rascunho/finalizar
-```
-
-Cada item é validado novamente no catálogo local da Olist. O preço não é
-recebido do gateway: a API usa exclusivamente o preço atual sincronizado.
-
-## Encarte
+A pendência é criada em `comercial.pendencias_comerciais` com o tipo:
 
 ```text
-GET /encarte/ofertas?quantidade=3..12
+revisar_itens_catalogo
 ```
 
-Produtos ativos do encarte com preço válido são retornados sem consulta de
-estoque. O estoque não aparece na mensagem comercial e não bloqueia a oferta.
-
-## Limite desta etapa
-
-A confirmação deixa o orçamento interno com status `confirmado`. A criação
-do orçamento real na Olist e o PDF serão ligados em uma etapa posterior.
+Não há migração SQL nesta versão.
