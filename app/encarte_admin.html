@@ -312,7 +312,7 @@
 <body>
 <header>
   <h1>Gestão do Encarte</h1>
-  <p>RBK Distribuidora — cadastro por SKU e seleção de 3 a 5 ofertas</p>
+  <p>RBK Distribuidora — cadastro por SKU e seleção de 3 a 12 ofertas</p>
 </header>
 
 <main>
@@ -368,7 +368,7 @@
     <section class="card col-7">
       <h2>Adicionar produto pelo SKU</h2>
       <p class="subtitulo">
-        A descrição, preços e estoque são consultados no catálogo sincronizado da Olist.
+        A descrição, o preço e o estoque são consultados na Olist. O valor é somente leitura e não pode ser alterado nesta tela.
       </p>
 
       <div class="campos">
@@ -377,7 +377,7 @@
           <input id="sku" placeholder="Ex.: 13799"
                  onkeydown="if(event.key==='Enter') consultarSku()">
         </div>
-        <div class="campo-3">
+        <div class="campo-6">
           <label for="prioridade">Prioridade</label>
           <select id="prioridade">
             <option value="1">1 — Alta</option>
@@ -386,11 +386,6 @@
             <option value="4">4</option>
             <option value="5">5 — Baixa</option>
           </select>
-        </div>
-        <div class="campo-3">
-          <label for="precoEncarte">Preço do encarte</label>
-          <input id="precoEncarte" type="number" min="0.01"
-                 step="0.01" placeholder="Opcional">
         </div>
         <div class="campo-12">
           <label for="observacao">Observação comercial</label>
@@ -420,8 +415,7 @@
             <tr>
               <th>SKU</th>
               <th>Descrição</th>
-              <th>Preço catálogo</th>
-              <th>Preço encarte</th>
+              <th>Preço atual Olist</th>
               <th>Prioridade</th>
               <th>Status</th>
               <th>Observação</th>
@@ -429,7 +423,7 @@
             </tr>
           </thead>
           <tbody id="corpoTabela">
-            <tr><td colspan="8">Conecte-se para carregar os produtos.</td></tr>
+            <tr><td colspan="7">Conecte-se para carregar os produtos.</td></tr>
           </tbody>
         </table>
       </div>
@@ -438,13 +432,20 @@
     <section class="card col-12">
       <h2>Prévia das ofertas do Carlos</h2>
       <p class="subtitulo">
-        Mostra de 3 a 5 produtos ativos, com preço e estoque disponíveis.
+        Mostra de 3 a 12 produtos ativos, com preço e estoque disponíveis.
       </p>
       <div class="linha-botoes" style="margin-bottom:14px">
         <select id="quantidadeOferta" style="width:190px">
           <option value="3">Mostrar 3 produtos</option>
           <option value="4">Mostrar 4 produtos</option>
           <option value="5" selected>Mostrar 5 produtos</option>
+          <option value="6">Mostrar 6 produtos</option>
+          <option value="7">Mostrar 7 produtos</option>
+          <option value="8">Mostrar 8 produtos</option>
+          <option value="9">Mostrar 9 produtos</option>
+          <option value="10">Mostrar 10 produtos</option>
+          <option value="11">Mostrar 11 produtos</option>
+          <option value="12">Mostrar 12 produtos</option>
         </select>
         <button class="secundario" onclick="carregarOfertas()">
           Gerar prévia
@@ -620,13 +621,18 @@
       metricas.append(normal, promocional, saldo);
       resultado.append(descricao, metricas);
 
-      if (!document.getElementById("precoEncarte").value) {
-        const sugerido = produto.preco_promocional || produto.preco_efetivo;
-        if (sugerido) {
-          document.getElementById("precoEncarte").value =
-            Number(sugerido).toFixed(2);
-        }
+      const aviso = document.createElement("div");
+      aviso.className = "rodape-info";
+      aviso.style.marginTop = "9px";
+      if (Number(estoque.disponivel || 0) <= 0) {
+        aviso.textContent =
+          "Estoque zerado: o produto pode ser cadastrado no encarte, " +
+          "mas não será oferecido pelo Carlos enquanto estiver indisponível.";
+      } else {
+        aviso.textContent =
+          "Preço obtido diretamente da Olist e bloqueado para edição.";
       }
+      resultado.append(aviso);
 
       document.getElementById("btnAdicionar").disabled = false;
     } catch (erro) {
@@ -642,14 +648,11 @@
     }
 
     limparStatus();
-    const precoCampo = document.getElementById("precoEncarte").value;
-
     try {
       await api("/encarte/produtos", {
         method: "POST",
         body: JSON.stringify({
           sku: produtoConsultado.sku,
-          preco_encarte: precoCampo ? Number(precoCampo) : null,
           prioridade: Number(document.getElementById("prioridade").value),
           observacao: document.getElementById("observacao").value.trim() || null
         })
@@ -657,7 +660,6 @@
 
       mostrarStatus("Produto adicionado ao encarte.");
       document.getElementById("sku").value = "";
-      document.getElementById("precoEncarte").value = "";
       document.getElementById("observacao").value = "";
       document.getElementById("prioridade").value = "3";
       document.getElementById("resultadoSku").className = "resultado-sku";
@@ -676,7 +678,7 @@
 
     if (!dados.itens.length) {
       corpo.innerHTML =
-        "<tr><td colspan='8'>Nenhum produto cadastrado.</td></tr>";
+        "<tr><td colspan='7'>Nenhum produto cadastrado.</td></tr>";
       return;
     }
 
@@ -690,12 +692,7 @@
       tr.innerHTML = `
         <td><strong>${escapeHtml(item.sku)}</strong></td>
         <td>${escapeHtml(descricao)}</td>
-        <td>${moeda(precoCatalogo)}</td>
-        <td>
-          <input class="mini" id="preco-${item.id}" type="number"
-                 min="0.01" step="0.01"
-                 value="${item.preco_encarte ?? ""}">
-        </td>
+        <td><strong>${moeda(precoCatalogo)}</strong></td>
         <td>
           <select class="mini" id="prioridade-${item.id}">
             ${[1,2,3,4,5].map(n =>
@@ -725,12 +722,10 @@
   }
 
   async function salvarItem(id) {
-    const preco = document.getElementById("preco-" + id).value;
     try {
       await api("/encarte/produtos/" + id, {
         method: "PATCH",
         body: JSON.stringify({
-          preco_encarte: preco ? Number(preco) : null,
           prioridade: Number(document.getElementById("prioridade-" + id).value),
           ativo: document.getElementById("ativo-" + id).checked,
           observacao: document.getElementById("obs-" + id).value.trim() || null

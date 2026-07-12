@@ -377,7 +377,7 @@ def solicitar_token_olist(
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.10.0",
+            "User-Agent": "RBK-Vendedor-IA-API/0.10.1",
         },
     )
 
@@ -615,7 +615,7 @@ def requisicao_get_olist(
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.10.0",
+            "User-Agent": "RBK-Vendedor-IA-API/0.10.1",
         },
     )
 
@@ -1802,10 +1802,6 @@ class EncarteProdutoAdicionar(BaseModel):
         min_length=1,
         max_length=80,
     )
-    preco_encarte: float | None = Field(
-        default=None,
-        gt=0,
-    )
     prioridade: int = Field(
         default=3,
         ge=1,
@@ -1823,10 +1819,6 @@ class EncarteProdutoAdicionar(BaseModel):
 
 
 class EncarteProdutoAtualizar(BaseModel):
-    preco_encarte: float | None = Field(
-        default=None,
-        gt=0,
-    )
     prioridade: int | None = Field(
         default=None,
         ge=1,
@@ -2229,7 +2221,6 @@ def obter_item_encarte_detalhado(
             ep.sku,
             ep.produto_id_olist,
             ep.descricao_snapshot,
-            ep.preco_encarte,
             ep.prioridade,
             ep.ativo,
             ep.observacao,
@@ -2262,7 +2253,6 @@ def obter_item_encarte_detalhado(
 
 def formatar_produto_encarte(
     produto: dict[str, Any],
-    preco_encarte: float | None = None,
 ) -> dict[str, Any]:
     preco_promocional = normalizar_preco(
         produto.get("preco_promocional")
@@ -2274,8 +2264,7 @@ def formatar_produto_encarte(
         produto.get("preco")
     )
     preco_oferta = (
-        normalizar_preco(preco_encarte)
-        or preco_promocional
+        preco_promocional
         or preco_catalogo
         or preco_normal
     )
@@ -2286,6 +2275,8 @@ def formatar_produto_encarte(
         "preco_promocional": preco_promocional,
         "preco_catalogo": preco_catalogo,
         "preco_oferta": preco_oferta,
+        "origem_preco": "olist",
+        "preco_editavel": False,
     }
 
 
@@ -2385,7 +2376,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RBK Vendedor IA API",
     description="API comercial do projeto piloto RBK Vendedor IA.",
-    version="0.10.0",
+    version="0.10.1",
     lifespan=lifespan,
 )
 
@@ -2396,7 +2387,7 @@ def saude() -> dict[str, str]:
         "status": "ok",
         "servico": "api-comercial",
         "projeto": "RBK Vendedor IA",
-        "versao": "0.10.0",
+        "versao": "0.10.1",
     }
 
 
@@ -2577,8 +2568,7 @@ def listar_produtos_encarte() -> dict[str, Any]:
                     ep.sku,
                     ep.produto_id_olist,
                     ep.descricao_snapshot,
-                    ep.preco_encarte,
-                    ep.prioridade,
+                            ep.prioridade,
                     ep.ativo,
                     ep.observacao,
                     ep.criado_em,
@@ -2646,13 +2636,11 @@ def adicionar_produto_encarte(
                     sku,
                     produto_id_olist,
                     descricao_snapshot,
-                    preco_encarte,
                     prioridade,
                     ativo,
                     observacao
                 )
                 VALUES (
-                    %s,
                     %s,
                     %s,
                     %s,
@@ -2664,7 +2652,6 @@ def adicionar_produto_encarte(
                 SET
                     produto_id_olist = EXCLUDED.produto_id_olist,
                     descricao_snapshot = EXCLUDED.descricao_snapshot,
-                    preco_encarte = EXCLUDED.preco_encarte,
                     prioridade = EXCLUDED.prioridade,
                     ativo = TRUE,
                     observacao = EXCLUDED.observacao,
@@ -2675,7 +2662,6 @@ def adicionar_produto_encarte(
                     produto["sku"],
                     produto["id"],
                     produto["descricao"],
-                    dados.preco_encarte,
                     dados.prioridade,
                     (
                         dados.observacao.strip()
@@ -2705,10 +2691,6 @@ def atualizar_produto_encarte(
 ) -> dict[str, Any]:
     campos: list[str] = []
     valores: list[Any] = []
-
-    if "preco_encarte" in dados.model_fields_set:
-        campos.append("preco_encarte = %s")
-        valores.append(dados.preco_encarte)
 
     if dados.prioridade is not None:
         campos.append("prioridade = %s")
@@ -2808,7 +2790,7 @@ def selecionar_ofertas_encarte(
     quantidade: int = Query(
         default=5,
         ge=3,
-        le=5,
+        le=12,
     ),
     excluir_skus: str | None = Query(
         default=None,
@@ -2855,8 +2837,7 @@ def selecionar_ofertas_encarte(
                     ep.sku,
                     ep.produto_id_olist,
                     ep.descricao_snapshot,
-                    ep.preco_encarte,
-                    ep.prioridade,
+                            ep.prioridade,
                     ep.observacao,
                     cp.id_olist AS id,
                     cp.descricao,
@@ -2880,7 +2861,7 @@ def selecionar_ofertas_encarte(
                         ep.sku
                         || CURRENT_DATE::TEXT
                     )
-                LIMIT 20;
+                LIMIT 60;
                 """
             )
             candidatos = cursor.fetchall()
@@ -2907,9 +2888,6 @@ def selecionar_ofertas_encarte(
 
         preco_oferta = (
             normalizar_preco(
-                candidato.get("preco_encarte")
-            )
-            or normalizar_preco(
                 enriquecido.get("preco_promocional")
             )
             or normalizar_preco(
@@ -2950,12 +2928,9 @@ def selecionar_ofertas_encarte(
                         )
                     )
                 ),
-                "preco_encarte_cadastrado": (
-                    normalizar_preco(
-                        candidato.get("preco_encarte")
-                    )
-                ),
                 "preco_oferta": preco_oferta,
+                "origem_preco": "olist",
+                "preco_editavel": False,
                 "estoque_disponivel": disponivel,
                 "prioridade": candidato["prioridade"],
                 "observacao": candidato["observacao"],
