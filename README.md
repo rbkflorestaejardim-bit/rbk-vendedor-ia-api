@@ -1,41 +1,30 @@
-# RBK Vendedor IA API v0.10.2
+# RBK Vendedor IA API v0.11.0
 
-## Regra comercial do encarte
+## Etapa 31A — carrinho e orçamento de múltiplos itens
 
-Todo produto ativo cadastrado na tela do encarte pode ser ofertado pelo
-Carlos desde que tenha preço de venda válido na Olist.
+A API passa a manter um rascunho de orçamento durante a conversa do Carlos.
 
-O estoque não bloqueia a oferta.
-
-### Produto com estoque positivo
-
-É apresentado como `pronta_entrega`.
-
-### Produto com estoque zero ou consulta indisponível
-
-É apresentado como `sob_consulta`. A mensagem sugerida informa que a
-disponibilidade será verificada, sem prometer entrega imediata.
-
-## Tela
+### Endpoints
 
 ```text
-/encarte-admin
+POST /orcamentos-ia/rascunho/itens
+GET  /orcamentos-ia/rascunho/{chamada_externa_id}
+POST /orcamentos-ia/rascunho/finalizar
 ```
 
-A prévia continua permitindo de 3 a 12 produtos.
+Cada item é validado novamente no catálogo local da Olist. O preço não é
+recebido do gateway: a API usa exclusivamente o preço atual sincronizado.
 
-## Endpoint
+## Encarte
 
 ```text
 GET /encarte/ofertas?quantidade=3..12
 ```
 
-Cada oferta informa:
+Produtos ativos do encarte com preço válido são retornados sem consulta de
+estoque. O estoque não aparece na mensagem comercial e não bloqueia a oferta.
 
-- preço da Olist;
-- estoque consultado, quando disponível;
-- `disponibilidade_comercial`;
-- mensagem comercial sugerida;
-- prioridade definida na tela.
+## Limite desta etapa
 
-Não há migração SQL nesta versão.
+A confirmação deixa o orçamento interno com status `confirmado`. A criação
+do orçamento real na Olist e o PDF serão ligados em uma etapa posterior.

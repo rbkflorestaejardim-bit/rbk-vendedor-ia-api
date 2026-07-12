@@ -103,6 +103,14 @@ STATUS_PENDENCIA_COMERCIAL = {
     "cancelada",
 }
 
+STATUS_ORCAMENTO_IA = {
+    "rascunho",
+    "aguardando_confirmacao",
+    "confirmado",
+    "enviado_olist",
+    "cancelado",
+}
+
 FUSO_PROJETO = ZoneInfo("America/Sao_Paulo")
 
 STATUS_TWILIO_PARA_INTERNO = {
@@ -377,7 +385,7 @@ def solicitar_token_olist(
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.10.2",
+            "User-Agent": "RBK-Vendedor-IA-API/0.11.0",
         },
     )
 
@@ -615,7 +623,7 @@ def requisicao_get_olist(
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.10.2",
+            "User-Agent": "RBK-Vendedor-IA-API/0.11.0",
         },
     )
 
@@ -1832,6 +1840,67 @@ class EncarteProdutoAtualizar(BaseModel):
 
 
 
+class OrcamentoIAItemAdicionar(BaseModel):
+    chamada_externa_id: str = Field(
+        min_length=8,
+        max_length=120,
+    )
+    cliente_id: UUID
+    vendedor_codigo: str = Field(
+        min_length=2,
+        max_length=40,
+    )
+    sku: str = Field(
+        min_length=1,
+        max_length=80,
+    )
+    quantidade: float = Field(
+        gt=0,
+        le=100000,
+    )
+    origem: Literal[
+        "catalogo",
+        "encarte",
+        "complementar",
+    ] = "catalogo"
+    disponibilidade: Literal[
+        "pronta_entrega",
+        "sob_consulta",
+        "nao_considerada",
+        "nao_informada",
+    ] = "nao_informada"
+    dados_adicionais: dict[str, Any] = Field(
+        default_factory=dict,
+    )
+
+    @field_validator(
+        "chamada_externa_id",
+        "vendedor_codigo",
+        "sku",
+    )
+    @classmethod
+    def limpar_texto_obrigatorio(cls, valor: str) -> str:
+        return valor.strip()
+
+
+class OrcamentoIAFinalizar(BaseModel):
+    chamada_externa_id: str = Field(
+        min_length=8,
+        max_length=120,
+    )
+    status: Literal[
+        "aguardando_confirmacao",
+        "confirmado",
+        "cancelado",
+    ] = "confirmado"
+
+    @field_validator("chamada_externa_id")
+    @classmethod
+    def limpar_chamada_externa_id(cls, valor: str) -> str:
+        return valor.strip()
+
+
+
 class ClienteCriar(BaseModel):
     crm_origem_id: str | None = Field(default=None, max_length=200)
     olist_id: str | None = Field(default=None, max_length=200)
@@ -2281,6 +2350,183 @@ def formatar_produto_encarte(
 
 
 
+def obter_orcamento_ia_detalhado(
+    cursor,
+    orcamento_id: UUID,
+) -> dict[str, Any]:
+    cursor.execute(
+        """
+        SELECT
+            o.id,
+            o.chamada_externa_id,
+            o.status,
+            o.quantidade_linhas,
+            o.quantidade_unidades,
+            o.valor_total,
+            o.origem,
+            o.confirmado_em,
+            o.criado_em,
+            o.atualizado_em,
+            c.id AS cliente_id,
+            c.razao_social,
+            c.nome_fantasia,
+            c.nome_contato,
+            c.telefone,
+            c.whatsapp,
+            v.id AS vendedor_id,
+            v.codigo AS vendedor_codigo,
+            v.nome_exibicao AS vendedor_nome
+        FROM comercial.orcamentos_ia o
+        JOIN comercial.clientes c
+            ON c.id = o.cliente_id
+        JOIN comercial.vendedores_ia v
+            ON v.id = o.vendedor_id
+        WHERE o.id = %s;
+        """,
+        (orcamento_id,),
+    )
+    orcamento = cursor.fetchone()
+
+    if orcamento is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Orçamento IA não encontrado.",
+        )
+
+    cursor.execute(
+        """
+        SELECT
+            id,
+            sku,
+            produto_id_olist,
+            descricao,
+            quantidade,
+            valor_unitario,
+            valor_total,
+            origem,
+            disponibilidade,
+            dados_adicionais,
+            criado_em,
+            atualizado_em
+        FROM comercial.orcamento_itens_ia
+        WHERE orcamento_id = %s
+        ORDER BY criado_em, descricao;
+        """,
+        (orcamento_id,),
+    )
+    itens = cursor.fetchall()
+
+    return {
+        **orcamento,
+        "itens": itens,
+    }
+
+
+def recalcular_orcamento_ia(
+    cursor,
+    orcamento_id: UUID,
+) -> None:
+    cursor.execute(
+        """
+        UPDATE comercial.orcamentos_ia o
+        SET
+            quantidade_linhas = resumo.quantidade_linhas,
+            quantidade_unidades = resumo.quantidade_unidades,
+            valor_total = resumo.valor_total,
+            atualizado_em = NOW()
+        FROM (
+            SELECT
+                COUNT(*)::INTEGER AS quantidade_linhas,
+                COALESCE(SUM(quantidade), 0) AS quantidade_unidades,
+                COALESCE(SUM(valor_total), 0) AS valor_total
+            FROM comercial.orcamento_itens_ia
+            WHERE orcamento_id = %s
+        ) resumo
+        WHERE o.id = %s;
+        """,
+        (orcamento_id, orcamento_id),
+    )
+
+
+def obter_ou_criar_orcamento_ia(
+    cursor,
+    chamada_externa_id: str,
+    cliente_id: UUID,
+    vendedor_id: UUID,
+) -> dict[str, Any]:
+    cursor.execute(
+        """
+        INSERT INTO comercial.orcamentos_ia (
+            chamada_externa_id,
+            cliente_id,
+            vendedor_id,
+            status,
+            origem
+        )
+        VALUES (
+            %s,
+            %s,
+            %s,
+            'rascunho',
+            'agente_voz'
+        )
+        ON CONFLICT (chamada_externa_id) DO NOTHING
+        RETURNING id, cliente_id, vendedor_id, status;
+        """,
+        (
+            chamada_externa_id,
+            cliente_id,
+            vendedor_id,
+        ),
+    )
+    orcamento = cursor.fetchone()
+
+    if orcamento is None:
+        cursor.execute(
+            """
+            SELECT id, cliente_id, vendedor_id, status
+            FROM comercial.orcamentos_ia
+            WHERE chamada_externa_id = %s;
+            """,
+            (chamada_externa_id,),
+        )
+        orcamento = cursor.fetchone()
+
+    if orcamento is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Não foi possível obter o orçamento IA.",
+        )
+
+    if (
+        orcamento["cliente_id"] != cliente_id
+        or orcamento["vendedor_id"] != vendedor_id
+    ):
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail=(
+                "A chamada já está vinculada a outro cliente "
+                "ou vendedor."
+            ),
+        )
+
+    if orcamento["status"] in {
+        "confirmado",
+        "enviado_olist",
+        "cancelado",
+    }:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail=(
+                "O orçamento não aceita novos itens no status "
+                f"{orcamento['status']}."
+            ),
+        )
+
+    return orcamento
+
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not DATABASE_URL:
@@ -2337,7 +2583,9 @@ async def lifespan(app: FastAPI):
                     to_regclass('comercial.olist_catalogo_sincronizacoes') AS tabela_catalogo_sync,
                     to_regclass('comercial.pendencias_comerciais') AS tabela_pendencias_comerciais,
                     to_regclass('comercial.encarte_configuracao') AS tabela_encarte_configuracao,
-                    to_regclass('comercial.encarte_produtos') AS tabela_encarte_produtos;
+                    to_regclass('comercial.encarte_produtos') AS tabela_encarte_produtos,
+                    to_regclass('comercial.orcamentos_ia') AS tabela_orcamentos_ia,
+                    to_regclass('comercial.orcamento_itens_ia') AS tabela_orcamento_itens_ia;
                 """
             )
             resultado = cursor.fetchone()
@@ -2363,6 +2611,8 @@ async def lifespan(app: FastAPI):
                 resultado["tabela_pendencias_comerciais"],
                 resultado["tabela_encarte_configuracao"],
                 resultado["tabela_encarte_produtos"],
+                resultado["tabela_orcamentos_ia"],
+                resultado["tabela_orcamento_itens_ia"],
             ]
 
             if any(tabela is None for tabela in tabelas):
@@ -2376,7 +2626,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RBK Vendedor IA API",
     description="API comercial do projeto piloto RBK Vendedor IA.",
-    version="0.10.2",
+    version="0.11.0",
     lifespan=lifespan,
 )
 
@@ -2387,7 +2637,7 @@ def saude() -> dict[str, str]:
         "status": "ok",
         "servico": "api-comercial",
         "projeto": "RBK Vendedor IA",
-        "versao": "0.10.2",
+        "versao": "0.11.0",
     }
 
 
@@ -2836,8 +3086,7 @@ def selecionar_ofertas_encarte(
                     ep.id AS encarte_item_id,
                     ep.sku,
                     ep.produto_id_olist,
-                    ep.descricao_snapshot,
-                            ep.prioridade,
+                    ep.prioridade,
                     ep.observacao,
                     cp.id_olist AS id,
                     cp.descricao,
@@ -2847,7 +3096,6 @@ def selecionar_ofertas_encarte(
                     cp.preco_promocional,
                     cp.preco_efetivo,
                     cp.preco_disponivel,
-                    cp.localizacao,
                     cp.ativo,
                     cp.sincronizado_em
                 FROM comercial.encarte_produtos ep
@@ -2855,121 +3103,73 @@ def selecionar_ofertas_encarte(
                     ON cp.sku = ep.sku
                 WHERE ep.ativo = TRUE
                   AND cp.ativo = TRUE
+                  AND ep.sku <> ALL(%s::TEXT[])
                 ORDER BY
                     ep.prioridade ASC,
                     MD5(
                         ep.sku
                         || CURRENT_DATE::TEXT
                     )
-                LIMIT 60;
-                """
+                LIMIT %s;
+                """,
+                (
+                    sorted(excluidos),
+                    max(quantidade * 4, 24),
+                ),
             )
             candidatos = cursor.fetchall()
         conexao.commit()
 
     ofertas: list[dict[str, Any]] = []
-    verificados = 0
-    limites_olist: dict[str, str] = {}
 
     for candidato in candidatos:
-        if candidato["sku"] in excluidos:
-            continue
-
-        verificados += 1
-
-        consulta_estoque_ok = True
-
-        try:
-            enriquecido, limites_olist = (
-                enriquecer_estoque_catalogo(
-                    candidato
-                )
-            )
-        except Exception:
-            consulta_estoque_ok = False
-            enriquecido = {
-                **candidato,
-                "estoque": {
-                    "saldo": None,
-                    "reservado": None,
-                    "disponivel": None,
-                    "status": "consulta_indisponivel",
-                    "depositos": [],
-                },
-            }
-
         preco_oferta = (
             normalizar_preco(
-                enriquecido.get("preco_promocional")
+                candidato.get("preco_promocional")
             )
             or normalizar_preco(
-                enriquecido.get("preco_efetivo")
+                candidato.get("preco_efetivo")
             )
             or normalizar_preco(
-                enriquecido.get("preco")
+                candidato.get("preco")
             )
-        )
-        disponivel = normalizar_quantidade(
-            (
-                enriquecido.get("estoque")
-                or {}
-            ).get("disponivel")
         )
 
-        # Regra comercial do encarte:
-        # produto ativo + preço de venda = produto ofertável.
-        # Estoque não bloqueia a oferta.
+        # Regra validada: encarte ativo + preço de venda válido.
+        # Estoque não é consultado nem mencionado ao cliente.
         if preco_oferta is None or preco_oferta <= 0:
             continue
 
-        pronta_entrega = bool(
-            disponivel is not None
-            and disponivel > 0
+        mensagem_sugerida = (
+            f"Também temos {candidato['descricao']} "
+            f"por R$ {preco_oferta:.2f} no encarte. "
+            "Quer aproveitar o preço e incluir algumas unidades?"
         )
-        disponibilidade_comercial = (
-            "pronta_entrega"
-            if pronta_entrega
-            else "sob_consulta"
-        )
-
-        if pronta_entrega:
-            mensagem_sugerida = (
-                f"Também temos {candidato['descricao']} "
-                f"por R$ {preco_oferta:.2f}. "
-                "Quer aproveitar e incluir algumas unidades?"
-            )
-        else:
-            mensagem_sugerida = (
-                f"Também temos {candidato['descricao']} "
-                f"por R$ {preco_oferta:.2f} no encarte. "
-                "Quer incluir algumas unidades no orçamento? "
-                "Eu verifico a disponibilidade para você."
-            )
 
         ofertas.append(
             {
                 "encarte_item_id": candidato[
                     "encarte_item_id"
                 ],
+                "id": candidato["id"],
                 "sku": candidato["sku"],
                 "descricao": candidato["descricao"],
                 "preco_normal": normalizar_preco(
-                    enriquecido.get("preco")
+                    candidato.get("preco")
                 ),
                 "preco_promocional_catalogo": (
                     normalizar_preco(
-                        enriquecido.get(
-                            "preco_promocional"
-                        )
+                        candidato.get("preco_promocional")
                     )
                 ),
                 "preco_oferta": preco_oferta,
+                "preco_efetivo": preco_oferta,
+                "preco_disponivel": True,
                 "origem_preco": "olist",
                 "preco_editavel": False,
-                "estoque_disponivel": disponivel,
-                "consulta_estoque_ok": consulta_estoque_ok,
+                "estoque_considerado": False,
                 "disponibilidade_comercial": (
-                    disponibilidade_comercial
+                    "nao_considerada"
                 ),
                 "prioridade": candidato["prioridade"],
                 "observacao": candidato["observacao"],
@@ -2982,8 +3182,6 @@ def selecionar_ofertas_encarte(
         if len(ofertas) >= quantidade:
             break
 
-        aguardar_rate_limit_olist(limites_olist)
-
     return {
         "status": (
             "ofertas_disponiveis"
@@ -2994,23 +3192,10 @@ def selecionar_ofertas_encarte(
         "quantidade_solicitada": quantidade,
         "quantidade_retornada": len(ofertas),
         "quantidade_minima_atingida": len(ofertas) >= 3,
-        "quantidade_pronta_entrega": sum(
-            1
-            for oferta in ofertas
-            if oferta["disponibilidade_comercial"]
-            == "pronta_entrega"
-        ),
-        "quantidade_sob_consulta": sum(
-            1
-            for oferta in ofertas
-            if oferta["disponibilidade_comercial"]
-            == "sob_consulta"
-        ),
-        "candidatos_verificados": verificados,
+        "estoque_considerado": False,
+        "candidatos_verificados": len(candidatos),
         "ofertas": ofertas,
-        "rate_limit": limites_olist,
     }
-
 
 
 @app.get(
@@ -3530,6 +3715,302 @@ def buscar_configuracao(chave: str) -> dict[str, Any]:
         )
 
     return configuracao
+
+
+@app.post(
+    "/orcamentos-ia/rascunho/itens",
+    tags=["Orçamentos IA"],
+    dependencies=[Depends(validar_api_key)],
+)
+def adicionar_item_orcamento_ia(
+    dados: OrcamentoIAItemAdicionar,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            obter_cliente_por_id(
+                cursor,
+                dados.cliente_id,
+            )
+            vendedor = obter_vendedor_por_codigo(
+                cursor,
+                dados.vendedor_codigo,
+            )
+            produto = buscar_produto_catalogo_exato(
+                cursor,
+                dados.sku,
+            )
+
+            if produto is None or not produto.get("ativo"):
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail=(
+                        "SKU não localizado ou inativo no "
+                        "catálogo sincronizado."
+                    ),
+                )
+
+            valor_unitario = (
+                normalizar_preco(
+                    produto.get("preco_promocional")
+                )
+                or normalizar_preco(
+                    produto.get("preco_efetivo")
+                )
+                or normalizar_preco(
+                    produto.get("preco")
+                )
+            )
+
+            if valor_unitario is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail=(
+                        "O produto não possui preço de venda válido."
+                    ),
+                )
+
+            orcamento = obter_ou_criar_orcamento_ia(
+                cursor,
+                dados.chamada_externa_id,
+                dados.cliente_id,
+                vendedor["id"],
+            )
+            quantidade = round(float(dados.quantidade), 3)
+            valor_total = round(
+                quantidade * valor_unitario,
+                2,
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.orcamento_itens_ia (
+                    orcamento_id,
+                    sku,
+                    produto_id_olist,
+                    descricao,
+                    quantidade,
+                    valor_unitario,
+                    valor_total,
+                    origem,
+                    disponibilidade,
+                    dados_adicionais
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s
+                )
+                ON CONFLICT (orcamento_id, sku) DO UPDATE
+                SET
+                    quantidade = (
+                        comercial.orcamento_itens_ia.quantidade
+                        + EXCLUDED.quantidade
+                    ),
+                    produto_id_olist = EXCLUDED.produto_id_olist,
+                    descricao = EXCLUDED.descricao,
+                    valor_unitario = EXCLUDED.valor_unitario,
+                    valor_total = ROUND(
+                        (
+                            comercial.orcamento_itens_ia.quantidade
+                            + EXCLUDED.quantidade
+                        )
+                        * EXCLUDED.valor_unitario,
+                        2
+                    ),
+                    origem = EXCLUDED.origem,
+                    disponibilidade = EXCLUDED.disponibilidade,
+                    dados_adicionais = (
+                        comercial.orcamento_itens_ia.dados_adicionais
+                        || EXCLUDED.dados_adicionais
+                    ),
+                    atualizado_em = NOW();
+                """,
+                (
+                    orcamento["id"],
+                    produto["sku"],
+                    produto["id"],
+                    produto["descricao"],
+                    quantidade,
+                    valor_unitario,
+                    valor_total,
+                    dados.origem,
+                    dados.disponibilidade,
+                    Jsonb(dados.dados_adicionais),
+                ),
+            )
+
+            recalcular_orcamento_ia(
+                cursor,
+                orcamento["id"],
+            )
+            detalhado = obter_orcamento_ia_detalhado(
+                cursor,
+                orcamento["id"],
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    vendedor_id,
+                    cliente_id,
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'adicionar_item_orcamento',
+                    'gateway_voz',
+                    %s,
+                    %s,
+                    TRUE
+                );
+                """,
+                (
+                    vendedor["id"],
+                    dados.cliente_id,
+                    Jsonb(
+                        {
+                            "chamada_externa_id": (
+                                dados.chamada_externa_id
+                            ),
+                            "sku": produto["sku"],
+                            "quantidade": quantidade,
+                            "origem": dados.origem,
+                        }
+                    ),
+                    Jsonb(
+                        {
+                            "orcamento_id": str(
+                                orcamento["id"]
+                            ),
+                            "valor_unitario": valor_unitario,
+                            "valor_total": valor_total,
+                        }
+                    ),
+                ),
+            )
+
+        conexao.commit()
+
+    return {
+        "adicionado": True,
+        "orcamento": detalhado,
+    }
+
+
+@app.get(
+    "/orcamentos-ia/rascunho/{chamada_externa_id}",
+    tags=["Orçamentos IA"],
+    dependencies=[Depends(validar_api_key)],
+)
+def consultar_orcamento_ia(
+    chamada_externa_id: str,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id
+                FROM comercial.orcamentos_ia
+                WHERE chamada_externa_id = %s;
+                """,
+                (chamada_externa_id.strip(),),
+            )
+            registro = cursor.fetchone()
+
+            if registro is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail="Orçamento IA não encontrado.",
+                )
+
+            return obter_orcamento_ia_detalhado(
+                cursor,
+                registro["id"],
+            )
+
+
+@app.post(
+    "/orcamentos-ia/rascunho/finalizar",
+    tags=["Orçamentos IA"],
+    dependencies=[Depends(validar_api_key)],
+)
+def finalizar_orcamento_ia(
+    dados: OrcamentoIAFinalizar,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, quantidade_linhas, status
+                FROM comercial.orcamentos_ia
+                WHERE chamada_externa_id = %s
+                FOR UPDATE;
+                """,
+                (dados.chamada_externa_id,),
+            )
+            orcamento = cursor.fetchone()
+
+            if orcamento is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail="Orçamento IA não encontrado.",
+                )
+
+            if (
+                dados.status != "cancelado"
+                and orcamento["quantidade_linhas"] <= 0
+            ):
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail="O orçamento não possui itens.",
+                )
+
+            cursor.execute(
+                """
+                UPDATE comercial.orcamentos_ia
+                SET
+                    status = %s,
+                    confirmado_em = CASE
+                        WHEN %s = 'confirmado'
+                        THEN COALESCE(confirmado_em, NOW())
+                        ELSE confirmado_em
+                    END,
+                    atualizado_em = NOW()
+                WHERE id = %s;
+                """,
+                (
+                    dados.status,
+                    dados.status,
+                    orcamento["id"],
+                ),
+            )
+            detalhado = obter_orcamento_ia_detalhado(
+                cursor,
+                orcamento["id"],
+            )
+        conexao.commit()
+
+    return {
+        "finalizado": True,
+        "orcamento": detalhado,
+        "proxima_etapa": (
+            "criar_orcamento_olist"
+            if dados.status == "confirmado"
+            else None
+        ),
+    }
 
 
 @app.post(

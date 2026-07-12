@@ -779,21 +779,8 @@
         const detalhes = document.createElement("div");
         detalhes.className = "metricas";
         detalhes.style.marginTop = "7px";
-        const estoqueTexto =
-          oferta.estoque_disponivel === null ||
-          oferta.estoque_disponivel === undefined
-            ? "não consultado"
-            : oferta.estoque_disponivel;
-
-        const disponibilidadeTexto =
-          oferta.disponibilidade_comercial === "pronta_entrega"
-            ? "pronta entrega"
-            : "sob consulta";
-
         detalhes.textContent =
           "Oferta: " + moeda(oferta.preco_oferta) +
-          " | Estoque: " + estoqueTexto +
-          " | Disponibilidade: " + disponibilidadeTexto +
           " | Prioridade: " + oferta.prioridade;
 
         const fala = document.createElement("div");
