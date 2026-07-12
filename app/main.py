@@ -88,6 +88,15 @@ STATUS_CHAMADA = {
     "cancelada",
 }
 
+STATUS_PENDENCIA_COMERCIAL = {
+    "pendente",
+    "em_analise",
+    "aguardando_reposicao",
+    "aguardando_catalogo",
+    "resolvida",
+    "cancelada",
+}
+
 FUSO_PROJETO = ZoneInfo("America/Sao_Paulo")
 
 STATUS_TWILIO_PARA_INTERNO = {
@@ -362,7 +371,7 @@ def solicitar_token_olist(
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.9.1",
+            "User-Agent": "RBK-Vendedor-IA-API/0.9.2",
         },
     )
 
@@ -600,7 +609,7 @@ def requisicao_get_olist(
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.9.1",
+            "User-Agent": "RBK-Vendedor-IA-API/0.9.2",
         },
     )
 
@@ -703,6 +712,25 @@ def tokens_busca(valor: Any) -> list[str]:
         "com",
         "um",
         "uma",
+        "uns",
+        "umas",
+        "preciso",
+        "quero",
+        "gostaria",
+        "procuro",
+        "procurando",
+        "comprar",
+        "tem",
+        "teria",
+        "voces",
+        "vocês",
+        "me",
+        "ver",
+        "favor",
+        "produto",
+        "peca",
+        "peça",
+        "epi",
     }
     return [
         token
@@ -1150,6 +1178,28 @@ def sincronizar_catalogo_olist(
         raise
 
 
+def tokens_adicionais_termo(
+    termo: str | None,
+    produto: str | None,
+    marca: str | None,
+    modelo: str | None,
+) -> list[str]:
+    termo_tokens = set(tokens_busca(termo))
+    representados = set(tokens_busca(produto))
+    representados.update(tokens_busca(marca))
+    representados.update(aliases_marca(marca))
+
+    modelo_partes = componentes_modelo(modelo)
+    representados.update(modelo_partes["prefixos"])
+    representados.update(modelo_partes["numeros"])
+
+    return sorted(
+        token
+        for token in termo_tokens
+        if token not in representados
+    )
+
+
 def avaliar_correspondencia_catalogo(
     item: dict[str, Any],
     termo: str | None,
@@ -1172,6 +1222,12 @@ def avaliar_correspondencia_catalogo(
     modelo_partes = componentes_modelo(modelo)
     numeros_modelo = modelo_partes["numeros"]
     prefixos_modelo = modelo_partes["prefixos"]
+    tokens_adicionais = tokens_adicionais_termo(
+        termo,
+        produto,
+        marca,
+        modelo,
+    )
 
     produto_ok = bool(
         not produto_tokens
@@ -1226,15 +1282,22 @@ def avaliar_correspondencia_catalogo(
         prefixo_literal_ok or stihl_alias_ok
     )
 
+    adicionais_encontrados = sorted(
+        token
+        for token in tokens_adicionais
+        if token in tokens_base
+    )
+    adicionais_ok = bool(
+        not tokens_adicionais
+        or len(adicionais_encontrados)
+        == len(tokens_adicionais)
+    )
+
     termo_tokens = tokens_busca(termo)
     termo_encontrados = sorted(
         token
         for token in termo_tokens
         if token in tokens_base
-    )
-    termo_ok = bool(
-        not termo_tokens
-        or len(termo_encontrados) == len(termo_tokens)
     )
 
     compatibilidade = bool(
@@ -1242,15 +1305,7 @@ def avaliar_correspondencia_catalogo(
         and marca_ok
         and numero_ok
         and prefixo_ok
-        and (
-            termo_ok
-            if not (
-                produto
-                or marca
-                or modelo
-            )
-            else True
-        )
+        and adicionais_ok
     )
 
     pontuacao = 0
@@ -1266,6 +1321,8 @@ def avaliar_correspondencia_catalogo(
         pontuacao += 60
     elif stihl_alias_ok:
         pontuacao += 40
+    if adicionais_ok and tokens_adicionais:
+        pontuacao += 140
     if termo_tokens:
         pontuacao += int(
             80
@@ -1284,6 +1341,7 @@ def avaliar_correspondencia_catalogo(
         "modelo_corresponde": bool(
             numero_ok and prefixo_ok
         ),
+        "descricao_adicional_corresponde": adicionais_ok,
         "marca_aliases_encontrados": (
             aliases_encontrados
         ),
@@ -1292,6 +1350,10 @@ def avaliar_correspondencia_catalogo(
         ),
         "prefixos_modelo_encontrados": (
             prefixos_encontrados
+        ),
+        "palavras_adicionais_exigidas": tokens_adicionais,
+        "palavras_adicionais_encontradas": (
+            adicionais_encontrados
         ),
         "palavras_termo_encontradas": (
             termo_encontrados
@@ -1310,9 +1372,19 @@ def buscar_candidatos_catalogo(
     modelo_partes = componentes_modelo(modelo)
     numeros_modelo = sorted(modelo_partes["numeros"])
     marca_tokens = sorted(aliases_marca(marca))
+    adicionais = tokens_adicionais_termo(
+        termo,
+        produto,
+        marca,
+        modelo,
+    )
 
     obrigatorios = sorted(
-        set(produto_tokens + numeros_modelo)
+        set(
+            produto_tokens
+            + numeros_modelo
+            + adicionais
+        )
     )
 
     if not obrigatorios and termo:
@@ -1395,6 +1467,7 @@ def buscar_candidatos_catalogo(
         "total_catalogo_ativo": total_catalogo,
         "catalogo_sincronizado_em": sincronizado_em,
         "tokens_obrigatorios": obrigatorios,
+        "palavras_adicionais": adicionais,
         "aliases_marca": marca_tokens,
     }
 
@@ -1819,6 +1892,27 @@ class ConversaVozRegistrar(BaseModel):
         return self
 
 
+class PendenciaComercialAtualizar(BaseModel):
+    status: Literal[
+        "pendente",
+        "em_analise",
+        "aguardando_reposicao",
+        "aguardando_catalogo",
+        "resolvida",
+        "cancelada",
+    ] | None = None
+    responsavel: str | None = Field(
+        default=None,
+        max_length=150,
+    )
+    previsao_retorno: datetime | None = None
+    resolucao: str | None = Field(
+        default=None,
+        max_length=4000,
+    )
+
+
+
 class TwilioTesteChamada(BaseModel):
     numero_destino: str = Field(
         description="Número verificado na Twilio, no padrão E.164.",
@@ -1898,7 +1992,8 @@ async def lifespan(app: FastAPI):
                     to_regclass('comercial.olist_oauth_states') AS tabela_olist_states,
                     to_regclass('comercial.consultas_olist') AS tabela_consultas_olist,
                     to_regclass('comercial.olist_catalogo_produtos') AS tabela_catalogo_olist,
-                    to_regclass('comercial.olist_catalogo_sincronizacoes') AS tabela_catalogo_sync;
+                    to_regclass('comercial.olist_catalogo_sincronizacoes') AS tabela_catalogo_sync,
+                    to_regclass('comercial.pendencias_comerciais') AS tabela_pendencias_comerciais;
                 """
             )
             resultado = cursor.fetchone()
@@ -1921,6 +2016,7 @@ async def lifespan(app: FastAPI):
                 resultado["tabela_consultas_olist"],
                 resultado["tabela_catalogo_olist"],
                 resultado["tabela_catalogo_sync"],
+                resultado["tabela_pendencias_comerciais"],
             ]
 
             if any(tabela is None for tabela in tabelas):
@@ -1934,7 +2030,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RBK Vendedor IA API",
     description="API comercial do projeto piloto RBK Vendedor IA.",
-    version="0.9.1",
+    version="0.9.2",
     lifespan=lifespan,
 )
 
@@ -1945,7 +2041,7 @@ def saude() -> dict[str, str]:
         "status": "ok",
         "servico": "api-comercial",
         "projeto": "RBK Vendedor IA",
-        "versao": "0.9.1",
+        "versao": "0.9.2",
     }
 
 
@@ -3422,6 +3518,314 @@ def montar_resumo_conversa_voz(
     return "; ".join(partes)[:4000]
 
 
+def criar_venda_futura_da_chamada(
+    cursor,
+    chamada_id: UUID,
+    dados: ConversaVozRegistrar,
+    vendedor: dict[str, Any],
+    resumo: str,
+) -> dict[str, Any] | None:
+    configuracoes = {
+        "sem_opcao_comercializavel": {
+            "tipo": "verificar_disponibilidade",
+            "etapa": "aguardando_disponibilidade",
+            "prioridade": 1,
+            "probabilidade": 45,
+            "acao": (
+                "Verificar preço, estoque e previsão de reposição; "
+                "retornar ao cliente."
+            ),
+        },
+        "aguardando_disponibilidade": {
+            "tipo": "verificar_disponibilidade",
+            "etapa": "aguardando_disponibilidade",
+            "prioridade": 1,
+            "probabilidade": 45,
+            "acao": (
+                "Verificar preço, estoque e previsão de reposição; "
+                "retornar ao cliente."
+            ),
+        },
+        "produto_nao_encontrado": {
+            "tipo": "revisar_catalogo",
+            "etapa": "revisao_catalogo",
+            "prioridade": 2,
+            "probabilidade": 30,
+            "acao": (
+                "Revisar descrição, código e possíveis equivalências "
+                "no catálogo; retornar ao cliente."
+            ),
+        },
+        "revisao_catalogo": {
+            "tipo": "revisar_catalogo",
+            "etapa": "revisao_catalogo",
+            "prioridade": 2,
+            "probabilidade": 30,
+            "acao": (
+                "Revisar descrição, código e possíveis equivalências "
+                "no catálogo; retornar ao cliente."
+            ),
+        },
+        "falha_consulta_catalogo": {
+            "tipo": "revisar_integracao",
+            "etapa": "revisao_integracao",
+            "prioridade": 1,
+            "probabilidade": 35,
+            "acao": (
+                "Reprocessar a consulta ao catálogo e retornar ao cliente."
+            ),
+        },
+        "revisao_integracao": {
+            "tipo": "revisar_integracao",
+            "etapa": "revisao_integracao",
+            "prioridade": 1,
+            "probabilidade": 35,
+            "acao": (
+                "Reprocessar a consulta ao catálogo e retornar ao cliente."
+            ),
+        },
+    }
+
+    configuracao = configuracoes.get(dados.resultado)
+    if configuracao is None:
+        return None
+
+    estado = dados.estado_comercial or {}
+    termo_busca = (
+        estado.get("termo_busca")
+        or estado.get("descricao_solicitada")
+        or estado.get("produto")
+        or "Produto solicitado pelo cliente"
+    )
+    ultima_consulta = estado.get("ultima_consulta_catalogo")
+    if not isinstance(ultima_consulta, dict):
+        ultima_consulta = {}
+
+    opcoes = (
+        ultima_consulta.get("opcoes_descartadas")
+        or ultima_consulta.get("opcoes_comercializaveis")
+        or ultima_consulta.get("opcoes")
+        or []
+    )
+    if not isinstance(opcoes, list):
+        opcoes = []
+
+    prazo_retorno = dados.fim_em + timedelta(hours=4)
+    titulo = f"Venda futura: {str(termo_busca)[:150]}"
+    descricao = (
+        f"{resumo}. Próxima ação: {configuracao['acao']}"
+    )[:4000]
+
+    cursor.execute(
+        """
+        INSERT INTO comercial.oportunidades (
+            cliente_id,
+            vendedor_id,
+            origem,
+            etapa,
+            titulo,
+            descricao,
+            probabilidade,
+            produtos,
+            proxima_acao,
+            proxima_acao_em
+        )
+        VALUES (
+            %s,
+            %s,
+            'agente_voz',
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s
+        )
+        RETURNING id;
+        """,
+        (
+            dados.cliente_id,
+            vendedor["id"],
+            configuracao["etapa"],
+            titulo,
+            descricao,
+            configuracao["probabilidade"],
+            Jsonb(opcoes),
+            configuracao["acao"],
+            prazo_retorno,
+        ),
+    )
+    oportunidade_id = cursor.fetchone()["id"]
+
+    cursor.execute(
+        """
+        INSERT INTO comercial.pendencias_comerciais (
+            oportunidade_id,
+            chamada_id,
+            cliente_id,
+            vendedor_id,
+            tipo,
+            prioridade,
+            status,
+            destinatario,
+            titulo,
+            descricao,
+            termo_busca,
+            estado_comercial,
+            opcoes_catalogo,
+            prazo_em
+        )
+        VALUES (
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            'pendente',
+            'gerente_ou_humano',
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s
+        )
+        ON CONFLICT (chamada_id, tipo) DO UPDATE
+        SET
+            atualizado_em = NOW()
+        RETURNING
+            id,
+            oportunidade_id,
+            tipo,
+            prioridade,
+            status,
+            destinatario,
+            prazo_em,
+            criado_em;
+        """,
+        (
+            oportunidade_id,
+            chamada_id,
+            dados.cliente_id,
+            vendedor["id"],
+            configuracao["tipo"],
+            configuracao["prioridade"],
+            titulo,
+            descricao,
+            str(termo_busca)[:300],
+            Jsonb(estado),
+            Jsonb(opcoes),
+            prazo_retorno,
+        ),
+    )
+    pendencia = cursor.fetchone()
+
+    cursor.execute(
+        """
+        UPDATE comercial.clientes
+        SET
+            status = CASE
+                WHEN status IN ('novo', 'teste_voz')
+                THEN 'oportunidade'
+                ELSE status
+            END,
+            proxima_acao_em = CASE
+                WHEN proxima_acao_em IS NULL
+                THEN %s
+                ELSE LEAST(proxima_acao_em, %s)
+            END,
+            atualizado_em = NOW()
+        WHERE id = %s;
+        """,
+        (
+            prazo_retorno,
+            prazo_retorno,
+            dados.cliente_id,
+        ),
+    )
+
+    cursor.execute(
+        """
+        INSERT INTO comercial.interacoes (
+            cliente_id,
+            vendedor_id,
+            canal,
+            direcao,
+            tipo,
+            resumo,
+            intencao,
+            mensagem_externa_id
+        )
+        VALUES (
+            %s,
+            %s,
+            'sistema',
+            'saida',
+            'pendencia_venda_futura',
+            %s,
+            'retorno_comercial',
+            %s
+        );
+        """,
+        (
+            dados.cliente_id,
+            vendedor["id"],
+            descricao,
+            f"{dados.chamada_externa_id}:pendencia",
+        ),
+    )
+
+    cursor.execute(
+        """
+        INSERT INTO comercial.acoes_agente (
+            vendedor_id,
+            cliente_id,
+            tipo_acao,
+            origem,
+            entrada,
+            saida,
+            sucesso
+        )
+        VALUES (
+            %s,
+            %s,
+            'criar_pendencia_venda_futura',
+            'persistencia_chamada_voz',
+            %s,
+            %s,
+            TRUE
+        );
+        """,
+        (
+            vendedor["id"],
+            dados.cliente_id,
+            Jsonb(
+                {
+                    "chamada_id": str(chamada_id),
+                    "resultado": dados.resultado,
+                    "termo_busca": termo_busca,
+                }
+            ),
+            Jsonb(
+                {
+                    "pendencia_id": str(pendencia["id"]),
+                    "oportunidade_id": str(oportunidade_id),
+                    "prazo_em": prazo_retorno.isoformat(),
+                }
+            ),
+        ),
+    )
+
+    return {
+        **pendencia,
+        "oportunidade_id": oportunidade_id,
+        "titulo": titulo,
+        "proxima_acao": configuracao["acao"],
+    }
+
+
 @app.post(
     "/chamadas/registrar-conversa-voz",
     tags=["Chamadas"],
@@ -3450,6 +3854,26 @@ def registrar_conversa_voz(
             chamada_existente = cursor.fetchone()
 
             if chamada_existente is not None:
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        oportunidade_id,
+                        tipo,
+                        prioridade,
+                        status,
+                        destinatario,
+                        prazo_em,
+                        criado_em
+                    FROM comercial.pendencias_comerciais
+                    WHERE chamada_id = %s
+                    ORDER BY criado_em DESC
+                    LIMIT 1;
+                    """,
+                    (chamada_existente["id"],),
+                )
+                pendencia_existente = cursor.fetchone()
+
                 return {
                     "criada": False,
                     "idempotente": True,
@@ -3458,6 +3882,7 @@ def registrar_conversa_voz(
                         cursor,
                         chamada_existente["id"],
                     ),
+                    "venda_futura": pendencia_existente,
                 }
 
             vendedor = obter_vendedor_por_codigo(
@@ -3774,6 +4199,14 @@ def registrar_conversa_voz(
                     ),
                 )
 
+            venda_futura = criar_venda_futura_da_chamada(
+                cursor,
+                chamada_id,
+                dados,
+                vendedor,
+                resumo,
+            )
+
             cursor.execute(
                 """
                 INSERT INTO comercial.acoes_agente (
@@ -3823,6 +4256,11 @@ def registrar_conversa_voz(
                             "interacoes_registradas": (
                                 interacoes_registradas
                             ),
+                            "pendencia_venda_futura_id": (
+                                str(venda_futura["id"])
+                                if venda_futura
+                                else None
+                            ),
                         }
                     ),
                     dados.duracao_segundos * 1000,
@@ -3841,7 +4279,167 @@ def registrar_conversa_voz(
         "idempotente": False,
         "interacoes_registradas": interacoes_registradas,
         "chamada": chamada,
+        "venda_futura": venda_futura,
     }
+
+
+@app.get(
+    "/pendencias-comerciais",
+    tags=["Gestão Comercial"],
+    dependencies=[Depends(validar_api_key)],
+)
+def listar_pendencias_comerciais(
+    status_pendencia: str | None = Query(
+        default="pendente",
+        alias="status",
+    ),
+    tipo: str | None = Query(default=None),
+    vendedor_codigo: str | None = Query(default=None),
+    limite: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    if (
+        status_pendencia
+        and status_pendencia not in STATUS_PENDENCIA_COMERCIAL
+    ):
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Status de pendência inválido.",
+        )
+
+    filtros: list[str] = []
+    parametros: list[Any] = []
+
+    if status_pendencia:
+        filtros.append("p.status = %s")
+        parametros.append(status_pendencia)
+
+    if tipo:
+        filtros.append("p.tipo = %s")
+        parametros.append(tipo)
+
+    if vendedor_codigo:
+        filtros.append("v.codigo = %s")
+        parametros.append(vendedor_codigo.upper())
+
+    where_sql = (
+        "WHERE " + " AND ".join(filtros)
+        if filtros
+        else ""
+    )
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT
+                    p.id,
+                    p.oportunidade_id,
+                    p.chamada_id,
+                    p.tipo,
+                    p.prioridade,
+                    p.status,
+                    p.destinatario,
+                    p.responsavel,
+                    p.titulo,
+                    p.descricao,
+                    p.termo_busca,
+                    p.estado_comercial,
+                    p.opcoes_catalogo,
+                    p.prazo_em,
+                    p.previsao_retorno,
+                    p.resolucao,
+                    p.criado_em,
+                    p.atualizado_em,
+                    c.nome_contato,
+                    c.telefone,
+                    c.whatsapp,
+                    c.uf,
+                    v.codigo AS vendedor_codigo,
+                    v.nome_exibicao AS vendedor_nome
+                FROM comercial.pendencias_comerciais p
+                JOIN comercial.clientes c
+                    ON c.id = p.cliente_id
+                JOIN comercial.vendedores_ia v
+                    ON v.id = p.vendedor_id
+                {where_sql}
+                ORDER BY
+                    p.prioridade ASC,
+                    p.prazo_em ASC NULLS LAST,
+                    p.criado_em ASC
+                LIMIT %s;
+                """,
+                [*parametros, limite],
+            )
+            itens = cursor.fetchall()
+
+    return {
+        "quantidade": len(itens),
+        "itens": itens,
+    }
+
+
+@app.patch(
+    "/pendencias-comerciais/{pendencia_id}",
+    tags=["Gestão Comercial"],
+    dependencies=[Depends(validar_api_key)],
+)
+def atualizar_pendencia_comercial(
+    pendencia_id: UUID,
+    dados: PendenciaComercialAtualizar,
+) -> dict[str, Any]:
+    atualizacoes: list[str] = []
+    valores: list[Any] = []
+
+    if dados.status is not None:
+        atualizacoes.append("status = %s")
+        valores.append(dados.status)
+
+        if dados.status in {"resolvida", "cancelada"}:
+            atualizacoes.append("resolvido_em = NOW()")
+
+    if dados.responsavel is not None:
+        atualizacoes.append("responsavel = %s")
+        valores.append(dados.responsavel)
+
+    if dados.previsao_retorno is not None:
+        atualizacoes.append("previsao_retorno = %s")
+        valores.append(dados.previsao_retorno)
+
+    if dados.resolucao is not None:
+        atualizacoes.append("resolucao = %s")
+        valores.append(dados.resolucao)
+
+    if not atualizacoes:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Nenhuma alteração foi informada.",
+        )
+
+    atualizacoes.append("atualizado_em = NOW()")
+    valores.append(pendencia_id)
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                f"""
+                UPDATE comercial.pendencias_comerciais
+                SET {", ".join(atualizacoes)}
+                WHERE id = %s
+                RETURNING *;
+                """,
+                valores,
+            )
+            pendencia = cursor.fetchone()
+
+            if pendencia is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail="Pendência comercial não encontrada.",
+                )
+
+        conexao.commit()
+
+    return pendencia
 
 
 @app.get(

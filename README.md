@@ -1,23 +1,42 @@
-# RBK Vendedor IA API v0.9.1
+# RBK Vendedor IA API v0.9.2
 
-Correção do erro HTTP 500 na pesquisa do catálogo Olist.
+Esta versão amplia a pesquisa do catálogo e cria uma fila real de vendas
+futuras para revisão humana ou pelo futuro agente gerente.
 
-## Causa
+## Busca flexível
 
-O resultado da pesquisa contém campos `datetime`, como:
+A pesquisa não depende mais de marca e modelo. O termo completo pode conter:
 
-- `catalogo_sincronizado_em`;
-- `sincronizado_em` dos produtos.
+- produto;
+- material;
+- cor;
+- tipo;
+- aplicação;
+- características;
+- números e referências.
 
-O FastAPI consegue devolver esses valores na resposta HTTP, mas o adaptador
-`Jsonb` do psycopg não serializa objetos `datetime` diretamente.
+Exemplos:
 
-## Correção
+- cinto de sustentação para roçadeira universal laranja;
+- luva de malha pigmentada branca;
+- embreagem para MS 170.
 
-Antes de gravar o histórico em `comercial.consultas_olist`, o resultado agora
-é convertido com `fastapi.encoders.jsonable_encoder`.
+As palavras adicionais do pedido passam a ser obrigatórias na descrição do
+produto, enquanto marca e modelo continuam aceitando aliases como Stihl/ST.
 
-Isso também protege a gravação contra UUID, Decimal, date e outros tipos
-compatíveis com respostas FastAPI, mas não nativos do JSON.
+## Venda futura
 
-Nenhuma alteração de SQL, gateway-voz, Asterisk ou PostgreSQL é necessária.
+Quando a chamada termina sem venda imediata por falta de preço, estoque,
+produto ou integração, a API cria automaticamente:
+
+- uma oportunidade;
+- uma pendência comercial;
+- uma interação de sistema;
+- uma próxima ação para retorno.
+
+A fila pode ser consultada em:
+
+- `GET /pendencias-comerciais`
+- `PATCH /pendencias-comerciais/{id}`
+
+O futuro agente gerente poderá consumir essa mesma fila.
