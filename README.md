@@ -1,25 +1,37 @@
-# RBK Vendedor IA API
+# RBK Vendedor IA API v0.8.0
 
-Versão `0.7.0`.
+Etapa 28A: conexão OAuth V3 com o Olist e pesquisa real de produtos.
 
-## Persistência de conversas de voz
+## Endpoints novos
 
-Esta versão preserva todos os endpoints da `0.6.0` e adiciona:
+- `GET /olist/status`
+- `POST /olist/oauth/iniciar`
+- `GET /olist/oauth/callback`
+- `GET /olist/produtos/pesquisar`
 
-- `POST /chamadas/registrar-conversa-voz`
+## Segurança
 
-O endpoint recebe uma conversa concluída pelo `gateway-voz` e registra, em
-uma única transação:
+- Client ID e Client Secret permanecem nas variáveis do Easypanel.
+- Access token e refresh token são criptografados no PostgreSQL com
+  `pgcrypto`.
+- O callback OAuth valida um `state` de uso único com validade de 15 minutos.
+- A resposta pública de produtos não expõe preço de custo.
 
-- chamada em `comercial.chamadas_ia`;
-- cada fala do cliente em `comercial.interacoes`;
-- cada resposta do vendedor IA em `comercial.interacoes`;
-- resumo final da ligação;
-- estado comercial e dados técnicos em `dados_extraidos`;
-- snapshot da última triagem em `clientes.dados_adicionais`;
-- auditoria em `comercial.acoes_agente`;
-- conclusão da agenda, quando `agenda_id` for informado.
+## Busca
 
-A operação é idempotente por `provedor + chamada_externa_id`. Execute antes
-o arquivo SQL da Etapa 27 para criar o índice de proteção e o cliente
-controlado do teste Linphone.
+A pesquisa usa combinações progressivas de:
+
+- termo completo;
+- peça + marca + modelo;
+- peça + modelo;
+- modelo;
+- peça.
+
+Os resultados são ranqueados localmente e os principais recebem consulta de
+estoque no endpoint oficial `/estoque/{idProduto}`.
+
+## Limite desta etapa
+
+A API já consulta produto, preço de venda e estoque. O ramal 605 ainda não
+chama essa pesquisa durante a ligação. Essa conexão será feita na Etapa 28B,
+depois da validação manual do endpoint.

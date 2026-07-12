@@ -1,11 +1,17 @@
 import hmac
 import os
 import re
+import json
+import time as time_module
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 from contextlib import asynccontextmanager
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import psycopg
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, Security, status as http_status
@@ -26,6 +32,35 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "").strip()
 TWILIO_BASE_URL = os.getenv("TWILIO_BASE_URL", "").strip().rstrip("/")
+
+
+OLIST_API_BASE_URL = os.getenv(
+    "OLIST_API_BASE_URL",
+    "https://api.tiny.com.br/public-api/v3",
+).strip().rstrip("/")
+OLIST_AUTH_URL = os.getenv(
+    "OLIST_AUTH_URL",
+    "https://accounts.tiny.com.br/realms/tiny/protocol/openid-connect/auth",
+).strip()
+OLIST_TOKEN_URL = os.getenv(
+    "OLIST_TOKEN_URL",
+    "https://accounts.tiny.com.br/realms/tiny/protocol/openid-connect/token",
+).strip()
+OLIST_CLIENT_ID = os.getenv("OLIST_CLIENT_ID", "").strip()
+OLIST_CLIENT_SECRET = os.getenv("OLIST_CLIENT_SECRET", "").strip()
+OLIST_REDIRECT_URI = os.getenv("OLIST_REDIRECT_URI", "").strip()
+OLIST_SCOPE = os.getenv("OLIST_SCOPE", "openid").strip() or "openid"
+OLIST_TOKEN_CRYPTO_KEY = os.getenv(
+    "OLIST_TOKEN_CRYPTO_KEY",
+    "",
+).strip()
+OLIST_ID_LISTA_PRECO = os.getenv(
+    "OLIST_ID_LISTA_PRECO",
+    "",
+).strip()
+OLIST_TIMEOUT_SECONDS = int(
+    os.getenv("OLIST_TIMEOUT_SECONDS", "25")
+)
 
 api_key_header = APIKeyHeader(
     name="X-API-Key",
@@ -274,6 +309,654 @@ async def validar_webhook_twilio(request: Request) -> dict[str, str]:
         )
 
     return dados
+
+
+def validar_configuracao_olist(
+    exigir_credenciais: bool = True,
+) -> None:
+    variaveis = {
+        "OLIST_API_BASE_URL": OLIST_API_BASE_URL,
+        "OLIST_AUTH_URL": OLIST_AUTH_URL,
+        "OLIST_TOKEN_URL": OLIST_TOKEN_URL,
+        "OLIST_REDIRECT_URI": OLIST_REDIRECT_URI,
+        "OLIST_TOKEN_CRYPTO_KEY": OLIST_TOKEN_CRYPTO_KEY,
+    }
+
+    if exigir_credenciais:
+        variaveis.update(
+            {
+                "OLIST_CLIENT_ID": OLIST_CLIENT_ID,
+                "OLIST_CLIENT_SECRET": OLIST_CLIENT_SECRET,
+            }
+        )
+
+    ausentes = [
+        nome
+        for nome, valor in variaveis.items()
+        if not valor
+    ]
+    if ausentes:
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Integração Olist incompleta. Variáveis ausentes: "
+                + ", ".join(ausentes)
+            ),
+        )
+
+
+def solicitar_token_olist(
+    dados_formulario: dict[str, str],
+) -> dict[str, Any]:
+    validar_configuracao_olist()
+
+    corpo = urllib.parse.urlencode(
+        dados_formulario
+    ).encode("utf-8")
+
+    requisicao = urllib.request.Request(
+        OLIST_TOKEN_URL,
+        data=corpo,
+        method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": "RBK-Vendedor-IA-API/0.8.0",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(
+            requisicao,
+            timeout=OLIST_TIMEOUT_SECONDS,
+        ) as resposta:
+            conteudo = resposta.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+            retorno = json.loads(conteudo)
+    except urllib.error.HTTPError as erro:
+        corpo_erro = erro.read().decode(
+            "utf-8",
+            errors="replace",
+        )
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"Olist OAuth retornou HTTP {erro.code}: "
+                f"{corpo_erro[:1000]}"
+            ),
+        ) from erro
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        json.JSONDecodeError,
+    ) as erro:
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail=f"Falha na comunicação OAuth com a Olist: {erro}",
+        ) from erro
+
+    if not retorno.get("access_token"):
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail="A Olist não retornou access_token.",
+        )
+
+    return retorno
+
+
+def salvar_tokens_olist(
+    cursor,
+    retorno: dict[str, Any],
+) -> dict[str, Any]:
+    agora = datetime.now(timezone.utc)
+    expira_em = agora + timedelta(
+        seconds=max(int(retorno.get("expires_in", 14400)), 60)
+    )
+    refresh_expira_em = agora + timedelta(
+        seconds=max(
+            int(retorno.get("refresh_expires_in", 86400)),
+            60,
+        )
+    )
+
+    access_token = str(retorno["access_token"])
+    refresh_token = str(retorno.get("refresh_token") or "")
+
+    if not refresh_token:
+        cursor.execute(
+            """
+            SELECT
+                pgp_sym_decrypt(
+                    refresh_token_cifrado,
+                    %s
+                ) AS refresh_token
+            FROM comercial.olist_oauth_tokens
+            WHERE id = 1;
+            """,
+            (OLIST_TOKEN_CRYPTO_KEY,),
+        )
+        existente = cursor.fetchone()
+        if existente:
+            refresh_token = existente["refresh_token"]
+
+    if not refresh_token:
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail="A Olist não retornou refresh_token.",
+        )
+
+    cursor.execute(
+        """
+        INSERT INTO comercial.olist_oauth_tokens (
+            id,
+            access_token_cifrado,
+            refresh_token_cifrado,
+            token_type,
+            scope,
+            expira_em,
+            refresh_expira_em,
+            atualizado_em
+        )
+        VALUES (
+            1,
+            pgp_sym_encrypt(%s, %s),
+            pgp_sym_encrypt(%s, %s),
+            %s,
+            %s,
+            %s,
+            %s,
+            NOW()
+        )
+        ON CONFLICT (id) DO UPDATE
+        SET
+            access_token_cifrado = EXCLUDED.access_token_cifrado,
+            refresh_token_cifrado = EXCLUDED.refresh_token_cifrado,
+            token_type = EXCLUDED.token_type,
+            scope = EXCLUDED.scope,
+            expira_em = EXCLUDED.expira_em,
+            refresh_expira_em = EXCLUDED.refresh_expira_em,
+            atualizado_em = NOW();
+        """,
+        (
+            access_token,
+            OLIST_TOKEN_CRYPTO_KEY,
+            refresh_token,
+            OLIST_TOKEN_CRYPTO_KEY,
+            str(retorno.get("token_type") or "Bearer"),
+            str(retorno.get("scope") or OLIST_SCOPE),
+            expira_em,
+            refresh_expira_em,
+        ),
+    )
+
+    return {
+        "token_type": str(retorno.get("token_type") or "Bearer"),
+        "scope": str(retorno.get("scope") or OLIST_SCOPE),
+        "expira_em": expira_em,
+        "refresh_expira_em": refresh_expira_em,
+    }
+
+
+def carregar_tokens_olist(cursor) -> dict[str, Any] | None:
+    validar_configuracao_olist()
+
+    cursor.execute(
+        """
+        SELECT
+            pgp_sym_decrypt(
+                access_token_cifrado,
+                %s
+            ) AS access_token,
+            pgp_sym_decrypt(
+                refresh_token_cifrado,
+                %s
+            ) AS refresh_token,
+            token_type,
+            scope,
+            expira_em,
+            refresh_expira_em,
+            atualizado_em
+        FROM comercial.olist_oauth_tokens
+        WHERE id = 1;
+        """,
+        (
+            OLIST_TOKEN_CRYPTO_KEY,
+            OLIST_TOKEN_CRYPTO_KEY,
+        ),
+    )
+    return cursor.fetchone()
+
+
+def obter_access_token_olist(
+    forcar_renovacao: bool = False,
+) -> str:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            tokens = carregar_tokens_olist(cursor)
+
+            if tokens is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail=(
+                        "A integração Olist ainda não foi autorizada. "
+                        "Execute /olist/oauth/iniciar."
+                    ),
+                )
+
+            agora = datetime.now(timezone.utc)
+            margem = timedelta(seconds=90)
+
+            if (
+                not forcar_renovacao
+                and tokens["expira_em"] > agora + margem
+            ):
+                return tokens["access_token"]
+
+            if tokens["refresh_expira_em"] <= agora + margem:
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail=(
+                        "O refresh token da Olist expirou. "
+                        "Autorize novamente em /olist/oauth/iniciar."
+                    ),
+                )
+
+            retorno = solicitar_token_olist(
+                {
+                    "grant_type": "refresh_token",
+                    "client_id": OLIST_CLIENT_ID,
+                    "client_secret": OLIST_CLIENT_SECRET,
+                    "refresh_token": tokens["refresh_token"],
+                }
+            )
+            salvar_tokens_olist(cursor, retorno)
+        conexao.commit()
+
+    return str(retorno["access_token"])
+
+
+def requisicao_get_olist(
+    caminho: str,
+    parametros: dict[str, Any] | None = None,
+    repetir_apos_401: bool = True,
+) -> tuple[Any, dict[str, str]]:
+    token = obter_access_token_olist()
+    url = f"{OLIST_API_BASE_URL}/{caminho.lstrip('/')}"
+
+    parametros_limpos = {
+        chave: valor
+        for chave, valor in (parametros or {}).items()
+        if valor not in (None, "")
+    }
+    if parametros_limpos:
+        url += "?" + urllib.parse.urlencode(parametros_limpos)
+
+    requisicao = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "RBK-Vendedor-IA-API/0.8.0",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(
+            requisicao,
+            timeout=OLIST_TIMEOUT_SECONDS,
+        ) as resposta:
+            conteudo = resposta.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+            dados = json.loads(conteudo)
+            limites = {
+                "limite": resposta.headers.get(
+                    "X-RateLimit-Limit",
+                    "",
+                ),
+                "restante": resposta.headers.get(
+                    "X-RateLimit-Remaining",
+                    "",
+                ),
+                "reset_segundos": resposta.headers.get(
+                    "X-RateLimit-Reset",
+                    "",
+                ),
+            }
+            return dados, limites
+
+    except urllib.error.HTTPError as erro:
+        corpo_erro = erro.read().decode(
+            "utf-8",
+            errors="replace",
+        )
+
+        if erro.code == 401 and repetir_apos_401:
+            obter_access_token_olist(forcar_renovacao=True)
+            return requisicao_get_olist(
+                caminho,
+                parametros,
+                repetir_apos_401=False,
+            )
+
+        if erro.code == 429:
+            raise HTTPException(
+                status_code=http_status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=(
+                    "Limite de requisições da Olist atingido. "
+                    f"Retorno: {corpo_erro[:1000]}"
+                ),
+            ) from erro
+
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"Olist API retornou HTTP {erro.code}: "
+                f"{corpo_erro[:1200]}"
+            ),
+        ) from erro
+
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        json.JSONDecodeError,
+    ) as erro:
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail=f"Falha na comunicação com a Olist: {erro}",
+        ) from erro
+
+
+def normalizar_texto_busca(valor: Any) -> str:
+    texto = unicodedata.normalize(
+        "NFKD",
+        str(valor or ""),
+    )
+    texto = "".join(
+        caractere
+        for caractere in texto
+        if not unicodedata.combining(caractere)
+    )
+    texto = texto.casefold()
+    texto = re.sub(r"[^a-z0-9]+", " ", texto)
+    return re.sub(r"\s+", " ", texto).strip()
+
+
+def tokens_busca(valor: Any) -> list[str]:
+    ignorar = {
+        "a",
+        "o",
+        "as",
+        "os",
+        "de",
+        "da",
+        "do",
+        "das",
+        "dos",
+        "para",
+        "por",
+        "com",
+        "um",
+        "uma",
+    }
+    return [
+        token
+        for token in normalizar_texto_busca(valor).split()
+        if token not in ignorar
+    ]
+
+
+def calcular_pontuacao_produto(
+    item: dict[str, Any],
+    termo: str | None,
+    produto: str | None,
+    marca: str | None,
+    modelo: str | None,
+) -> int:
+    descricao = normalizar_texto_busca(item.get("descricao"))
+    sku = normalizar_texto_busca(item.get("sku"))
+    base = f"{descricao} {sku}".strip()
+    pontos = 0
+
+    termo_normalizado = normalizar_texto_busca(termo)
+    if termo_normalizado and termo_normalizado in base:
+        pontos += 80
+
+    produto_tokens = tokens_busca(produto)
+    marca_tokens = tokens_busca(marca)
+    modelo_tokens = tokens_busca(modelo)
+
+    if produto_tokens:
+        encontrados = sum(
+            token in base
+            for token in produto_tokens
+        )
+        pontos += int(
+            35 * encontrados / len(produto_tokens)
+        )
+
+    if marca_tokens:
+        encontrados = sum(
+            token in base
+            for token in marca_tokens
+        )
+        pontos += int(
+            20 * encontrados / len(marca_tokens)
+        )
+
+    if modelo_tokens:
+        encontrados = sum(
+            token in base
+            for token in modelo_tokens
+        )
+        pontos += int(
+            55 * encontrados / len(modelo_tokens)
+        )
+
+        modelo_compacto = "".join(modelo_tokens)
+        base_compacta = base.replace(" ", "")
+        if modelo_compacto and modelo_compacto in base_compacta:
+            pontos += 30
+
+    return pontos
+
+
+def montar_consultas_olist(
+    termo: str | None,
+    produto: str | None,
+    marca: str | None,
+    modelo: str | None,
+) -> list[str]:
+    consultas_brutas = [
+        termo,
+        " ".join(
+            valor.strip()
+            for valor in (produto or "", marca or "", modelo or "")
+            if valor.strip()
+        ),
+        " ".join(
+            valor.strip()
+            for valor in (produto or "", modelo or "")
+            if valor.strip()
+        ),
+        modelo,
+        produto,
+    ]
+
+    consultas: list[str] = []
+    vistos: set[str] = set()
+
+    for consulta in consultas_brutas:
+        consulta_limpa = re.sub(
+            r"\s+",
+            " ",
+            str(consulta or ""),
+        ).strip()
+        chave = normalizar_texto_busca(consulta_limpa)
+        if consulta_limpa and chave not in vistos:
+            vistos.add(chave)
+            consultas.append(consulta_limpa)
+
+    return consultas
+
+
+def pesquisar_produtos_olist(
+    termo: str | None,
+    produto: str | None,
+    marca: str | None,
+    modelo: str | None,
+    limite: int,
+) -> dict[str, Any]:
+    consultas = montar_consultas_olist(
+        termo,
+        produto,
+        marca,
+        modelo,
+    )
+    if not consultas:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Informe termo ou os campos produto, marca e modelo."
+            ),
+        )
+
+    inicio = time_module.perf_counter()
+    candidatos: dict[int, dict[str, Any]] = {}
+    limites_olist: dict[str, str] = {}
+
+    for consulta in consultas:
+        parametros: dict[str, Any] = {
+            "nome": consulta,
+            "situacao": "A",
+            "limit": 100,
+            "offset": 0,
+        }
+        if OLIST_ID_LISTA_PRECO:
+            parametros["idListaPreco"] = OLIST_ID_LISTA_PRECO
+
+        retorno, limites_olist = requisicao_get_olist(
+            "produtos",
+            parametros,
+        )
+
+        for item in retorno.get("itens") or []:
+            produto_id = item.get("id")
+            if produto_id is None:
+                continue
+
+            pontuacao = calcular_pontuacao_produto(
+                item,
+                termo,
+                produto,
+                marca,
+                modelo,
+            )
+            item_normalizado = {
+                "id": int(produto_id),
+                "sku": item.get("sku"),
+                "descricao": item.get("descricao"),
+                "unidade": item.get("unidade"),
+                "gtin": item.get("gtin"),
+                "localizacao": (
+                    item.get("estoque") or {}
+                ).get("localizacao"),
+                "preco": (
+                    item.get("precos") or {}
+                ).get("preco"),
+                "preco_promocional": (
+                    item.get("precos") or {}
+                ).get("precoPromocional"),
+                "pontuacao": pontuacao,
+            }
+
+            atual = candidatos.get(int(produto_id))
+            if atual is None or pontuacao > atual["pontuacao"]:
+                candidatos[int(produto_id)] = item_normalizado
+
+        if len(candidatos) >= max(limite * 3, 12):
+            break
+
+    ordenados = sorted(
+        candidatos.values(),
+        key=lambda item: (
+            item["pontuacao"],
+            normalizar_texto_busca(item["descricao"]),
+        ),
+        reverse=True,
+    )[:limite]
+
+    resultados: list[dict[str, Any]] = []
+
+    for item in ordenados:
+        estoque, limites_olist = requisicao_get_olist(
+            f"estoque/{item['id']}",
+        )
+        preco = item.get("preco")
+        promocional = item.get("preco_promocional")
+        preco_efetivo = (
+            promocional
+            if promocional not in (None, 0, 0.0, "0", "0.00")
+            else preco
+        )
+
+        resultados.append(
+            {
+                **item,
+                "preco_efetivo": preco_efetivo,
+                "estoque": {
+                    "saldo": estoque.get("saldo"),
+                    "reservado": estoque.get("reservado"),
+                    "disponivel": estoque.get("disponivel"),
+                    "localizacao": estoque.get("localizacao"),
+                },
+            }
+        )
+
+    if not resultados:
+        status_resultado = "nao_encontrado"
+    elif (
+        len(resultados) == 1
+        or (
+            resultados[0]["pontuacao"] >= 90
+            and (
+                len(resultados) == 1
+                or resultados[0]["pontuacao"]
+                >= resultados[1]["pontuacao"] + 25
+            )
+        )
+    ):
+        status_resultado = "encontrado"
+    else:
+        status_resultado = "multiplos_resultados"
+
+    duracao_ms = int(
+        (time_module.perf_counter() - inicio) * 1000
+    )
+
+    return {
+        "status": status_resultado,
+        "consulta": {
+            "termo": termo,
+            "produto": produto,
+            "marca": marca,
+            "modelo": modelo,
+            "consultas_enviadas": consultas,
+            "id_lista_preco": (
+                int(OLIST_ID_LISTA_PRECO)
+                if OLIST_ID_LISTA_PRECO.isdigit()
+                else None
+            ),
+        },
+        "quantidade_resultados": len(resultados),
+        "resultados": resultados,
+        "rate_limit": limites_olist,
+        "duracao_ms": duracao_ms,
+    }
 
 
 class ClienteCriar(BaseModel):
@@ -582,7 +1265,10 @@ async def lifespan(app: FastAPI):
                     to_regclass('comercial.chamadas_ia') AS tabela_chamadas,
                     to_regclass('comercial.interacoes') AS tabela_interacoes,
                     to_regclass('comercial.acoes_agente') AS tabela_acoes,
-                    to_regclass('comercial.configuracoes') AS tabela_configuracoes;
+                    to_regclass('comercial.configuracoes') AS tabela_configuracoes,
+                    to_regclass('comercial.olist_oauth_tokens') AS tabela_olist_tokens,
+                    to_regclass('comercial.olist_oauth_states') AS tabela_olist_states,
+                    to_regclass('comercial.consultas_olist') AS tabela_consultas_olist;
                 """
             )
             resultado = cursor.fetchone()
@@ -600,6 +1286,9 @@ async def lifespan(app: FastAPI):
                 resultado["tabela_interacoes"],
                 resultado["tabela_acoes"],
                 resultado["tabela_configuracoes"],
+                resultado["tabela_olist_tokens"],
+                resultado["tabela_olist_states"],
+                resultado["tabela_consultas_olist"],
             ]
 
             if any(tabela is None for tabela in tabelas):
@@ -613,7 +1302,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RBK Vendedor IA API",
     description="API comercial do projeto piloto RBK Vendedor IA.",
-    version="0.7.0",
+    version="0.8.0",
     lifespan=lifespan,
 )
 
@@ -624,7 +1313,293 @@ def saude() -> dict[str, str]:
         "status": "ok",
         "servico": "api-comercial",
         "projeto": "RBK Vendedor IA",
-        "versao": "0.7.0",
+        "versao": "0.8.0",
+    }
+
+
+@app.get(
+    "/olist/status",
+    tags=["Olist"],
+    dependencies=[Depends(validar_api_key)],
+)
+def status_olist() -> dict[str, Any]:
+    configuracao = {
+        "api_base_url": OLIST_API_BASE_URL,
+        "redirect_uri": OLIST_REDIRECT_URI or None,
+        "client_id_configurado": bool(OLIST_CLIENT_ID),
+        "client_secret_configurado": bool(OLIST_CLIENT_SECRET),
+        "chave_criptografia_configurada": bool(
+            OLIST_TOKEN_CRYPTO_KEY
+        ),
+        "id_lista_preco": (
+            int(OLIST_ID_LISTA_PRECO)
+            if OLIST_ID_LISTA_PRECO.isdigit()
+            else None
+        ),
+    }
+
+    token = None
+    if OLIST_TOKEN_CRYPTO_KEY:
+        with obter_conexao() as conexao:
+            with conexao.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        token_type,
+                        scope,
+                        expira_em,
+                        refresh_expira_em,
+                        atualizado_em
+                    FROM comercial.olist_oauth_tokens
+                    WHERE id = 1;
+                    """
+                )
+                token = cursor.fetchone()
+
+    agora = datetime.now(timezone.utc)
+    return {
+        "configuracao": configuracao,
+        "autorizado": token is not None,
+        "access_token_valido": bool(
+            token and token["expira_em"] > agora
+        ),
+        "refresh_token_valido": bool(
+            token and token["refresh_expira_em"] > agora
+        ),
+        "token": token,
+    }
+
+
+@app.post(
+    "/olist/oauth/iniciar",
+    tags=["Olist"],
+    dependencies=[Depends(validar_api_key)],
+)
+def iniciar_oauth_olist() -> dict[str, Any]:
+    validar_configuracao_olist()
+
+    state = uuid4()
+    expira_em = datetime.now(timezone.utc) + timedelta(
+        minutes=15
+    )
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM comercial.olist_oauth_states
+                WHERE expira_em < NOW()
+                   OR usado_em IS NOT NULL;
+                """
+            )
+            cursor.execute(
+                """
+                INSERT INTO comercial.olist_oauth_states (
+                    state,
+                    expira_em
+                )
+                VALUES (%s, %s);
+                """,
+                (state, expira_em),
+            )
+        conexao.commit()
+
+    parametros = urllib.parse.urlencode(
+        {
+            "client_id": OLIST_CLIENT_ID,
+            "redirect_uri": OLIST_REDIRECT_URI,
+            "scope": OLIST_SCOPE,
+            "response_type": "code",
+            "state": str(state),
+        }
+    )
+    return {
+        "authorization_url": f"{OLIST_AUTH_URL}?{parametros}",
+        "state": state,
+        "expira_em": expira_em,
+    }
+
+
+@app.get(
+    "/olist/oauth/callback",
+    tags=["Olist"],
+)
+def callback_oauth_olist(
+    code: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    error: str | None = Query(default=None),
+    error_description: str | None = Query(default=None),
+) -> Response:
+    if error:
+        return Response(
+            content=(
+                "<h1>Autorização Olist não concluída</h1>"
+                f"<p>{error}: {error_description or ''}</p>"
+            ),
+            status_code=400,
+            media_type="text/html",
+        )
+
+    if not code or not state:
+        return Response(
+            content=(
+                "<h1>Parâmetros OAuth ausentes</h1>"
+                "<p>Não foram recebidos code e state.</p>"
+            ),
+            status_code=400,
+            media_type="text/html",
+        )
+
+    try:
+        state_uuid = UUID(state)
+    except ValueError:
+        return Response(
+            content="<h1>State OAuth inválido</h1>",
+            status_code=400,
+            media_type="text/html",
+        )
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT state
+                FROM comercial.olist_oauth_states
+                WHERE state = %s
+                  AND usado_em IS NULL
+                  AND expira_em > NOW()
+                FOR UPDATE;
+                """,
+                (state_uuid,),
+            )
+            registro_state = cursor.fetchone()
+
+            if registro_state is None:
+                return Response(
+                    content=(
+                        "<h1>Autorização expirada ou inválida</h1>"
+                        "<p>Inicie novamente pela API Comercial.</p>"
+                    ),
+                    status_code=400,
+                    media_type="text/html",
+                )
+
+            retorno = solicitar_token_olist(
+                {
+                    "grant_type": "authorization_code",
+                    "client_id": OLIST_CLIENT_ID,
+                    "client_secret": OLIST_CLIENT_SECRET,
+                    "redirect_uri": OLIST_REDIRECT_URI,
+                    "code": code,
+                }
+            )
+            token_info = salvar_tokens_olist(
+                cursor,
+                retorno,
+            )
+            cursor.execute(
+                """
+                UPDATE comercial.olist_oauth_states
+                SET usado_em = NOW()
+                WHERE state = %s;
+                """,
+                (state_uuid,),
+            )
+
+        conexao.commit()
+
+    return Response(
+        content=(
+            "<h1>Olist conectada com sucesso</h1>"
+            "<p>Os tokens foram armazenados de forma criptografada "
+            "no PostgreSQL.</p>"
+            f"<p>Access token válido até: "
+            f"{token_info['expira_em'].isoformat()}</p>"
+            "<p>Você pode fechar esta página.</p>"
+        ),
+        media_type="text/html",
+    )
+
+
+@app.get(
+    "/olist/produtos/pesquisar",
+    tags=["Olist"],
+    dependencies=[Depends(validar_api_key)],
+)
+def pesquisar_produtos(
+    termo: str | None = Query(
+        default=None,
+        min_length=2,
+        max_length=200,
+    ),
+    produto: str | None = Query(
+        default=None,
+        min_length=2,
+        max_length=120,
+    ),
+    marca: str | None = Query(
+        default=None,
+        min_length=1,
+        max_length=80,
+    ),
+    modelo: str | None = Query(
+        default=None,
+        min_length=1,
+        max_length=80,
+    ),
+    limite: int = Query(default=5, ge=1, le=10),
+) -> dict[str, Any]:
+    resultado = pesquisar_produtos_olist(
+        termo=termo,
+        produto=produto,
+        marca=marca,
+        modelo=modelo,
+        limite=limite,
+    )
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO comercial.consultas_olist (
+                    termo,
+                    produto,
+                    marca,
+                    modelo,
+                    status,
+                    quantidade_resultados,
+                    duracao_ms,
+                    resposta
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s
+                )
+                RETURNING id;
+                """,
+                (
+                    termo,
+                    produto,
+                    marca,
+                    modelo,
+                    resultado["status"],
+                    resultado["quantidade_resultados"],
+                    resultado["duracao_ms"],
+                    Jsonb(resultado),
+                ),
+            )
+            consulta_id = cursor.fetchone()["id"]
+        conexao.commit()
+
+    return {
+        "consulta_id": consulta_id,
+        **resultado,
     }
 
 
