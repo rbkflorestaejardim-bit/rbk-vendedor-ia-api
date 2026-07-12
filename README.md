@@ -1,34 +1,25 @@
 # RBK Vendedor IA API
 
-Versão `0.5.0`.
+Versão `0.7.0`.
 
-## Telefonia Twilio
+## Persistência de conversas de voz
 
-Esta versão adiciona:
+Esta versão preserva todos os endpoints da `0.6.0` e adiciona:
 
-- Primeira chamada real pela Twilio;
-- Template oficial de voz permitido na conta Trial;
-- Consulta do estado da chamada;
-- Webhook assinado para progresso da chamada;
-- Auditoria dos eventos da Twilio.
+- `POST /chamadas/registrar-conversa-voz`
 
-## Novos endpoints
+O endpoint recebe uma conversa concluída pelo `gateway-voz` e registra, em
+uma única transação:
 
-- `POST /telefonia/twilio/teste`
-- `GET /telefonia/twilio/chamadas/{call_sid}`
-- `POST /webhooks/twilio/status-chamada` (uso interno da Twilio)
+- chamada em `comercial.chamadas_ia`;
+- cada fala do cliente em `comercial.interacoes`;
+- cada resposta do vendedor IA em `comercial.interacoes`;
+- resumo final da ligação;
+- estado comercial e dados técnicos em `dados_extraidos`;
+- snapshot da última triagem em `clientes.dados_adicionais`;
+- auditoria em `comercial.acoes_agente`;
+- conclusão da agenda, quando `agenda_id` for informado.
 
-## Variáveis obrigatórias
-
-- `DATABASE_URL`
-- `API_KEY`
-- `TWILIO_ACCOUNT_SID`
-- `TWILIO_AUTH_TOKEN`
-- `TWILIO_PHONE_NUMBER`
-- `TWILIO_BASE_URL`
-
-## Observação do primeiro teste
-
-O endpoint de teste utiliza o template oficial
-`voice_text_to_speech` da Twilio. Depois que a chamada real for
-validada, a próxima versão conectará o fluxo de voz próprio do vendedor IA.
+A operação é idempotente por `provedor + chamada_externa_id`. Execute antes
+o arquivo SQL da Etapa 27 para criar o índice de proteção e o cliente
+controlado do teste Linphone.

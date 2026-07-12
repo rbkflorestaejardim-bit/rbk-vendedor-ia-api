@@ -453,6 +453,61 @@ class ChamadaFinalizar(BaseModel):
         return self
 
 
+class TurnoConversaVoz(BaseModel):
+    numero: int = Field(ge=1, le=100)
+    cliente: str = Field(min_length=1, max_length=5000)
+    agente: str | None = Field(default=None, max_length=5000)
+
+
+class ConversaVozRegistrar(BaseModel):
+    cliente_id: UUID
+    vendedor_codigo: str = Field(max_length=40)
+    agenda_id: UUID | None = None
+    provedor: str = Field(
+        default="asterisk_audiosocket",
+        max_length=60,
+    )
+    chamada_externa_id: str = Field(min_length=8, max_length=150)
+    numero_origem: str | None = Field(default=None, max_length=30)
+    numero_destino: str | None = Field(default=None, max_length=30)
+    direcao: Literal["entrada", "saida"] = "saida"
+    inicio_em: datetime
+    fim_em: datetime
+    duracao_segundos: int = Field(ge=0)
+    resumo: str | None = Field(default=None, max_length=4000)
+    sentimento: str | None = Field(default=None, max_length=40)
+    intencao: str = Field(
+        default="consulta_peca",
+        max_length=80,
+    )
+    resultado: str = Field(max_length=80)
+    levantamento_completo: bool = False
+    motivo_encerramento: str | None = Field(
+        default=None,
+        max_length=200,
+    )
+    estado_comercial: dict[str, Any] = Field(default_factory=dict)
+    turnos: list[TurnoConversaVoz] = Field(
+        default_factory=list,
+        max_length=20,
+    )
+    modelos: dict[str, Any] = Field(default_factory=dict)
+    dados_extraidos: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("vendedor_codigo")
+    @classmethod
+    def validar_codigo_vendedor(cls, valor: str) -> str:
+        return valor.upper()
+
+    @model_validator(mode="after")
+    def validar_periodo(self):
+        if self.fim_em < self.inicio_em:
+            raise ValueError(
+                "fim_em não pode ser anterior a inicio_em."
+            )
+        return self
+
+
 class TwilioTesteChamada(BaseModel):
     numero_destino: str = Field(
         description="Número verificado na Twilio, no padrão E.164.",
@@ -558,7 +613,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RBK Vendedor IA API",
     description="API comercial do projeto piloto RBK Vendedor IA.",
-    version="0.6.0",
+    version="0.7.0",
     lifespan=lifespan,
 )
 
@@ -569,7 +624,7 @@ def saude() -> dict[str, str]:
         "status": "ok",
         "servico": "api-comercial",
         "projeto": "RBK Vendedor IA",
-        "versao": "0.6.0",
+        "versao": "0.7.0",
     }
 
 
@@ -1607,6 +1662,467 @@ def listar_chamadas(
     }
 
 
+def montar_resumo_conversa_voz(
+    estado: dict[str, Any],
+    levantamento_completo: bool,
+    resultado: str,
+) -> str:
+    partes: list[str] = []
+
+    campos = [
+        ("Cliente", estado.get("nome_cliente")),
+        ("Produto", estado.get("produto")),
+        ("Marca", estado.get("marca_maquina")),
+        ("Modelo", estado.get("modelo_maquina")),
+        ("Quantidade", estado.get("quantidade")),
+    ]
+
+    for rotulo, valor in campos:
+        if valor not in (None, "", [], {}):
+            partes.append(f"{rotulo}: {valor}")
+
+    dados_tecnicos = estado.get("dados_tecnicos")
+    if isinstance(dados_tecnicos, dict) and dados_tecnicos:
+        dados_formatados = ", ".join(
+            f"{chave}: {valor}"
+            for chave, valor in dados_tecnicos.items()
+            if valor not in (None, "", [], {})
+        )
+        if dados_formatados:
+            partes.append(f"Dados técnicos: {dados_formatados}")
+
+    partes.append(
+        "Levantamento técnico completo"
+        if levantamento_completo
+        else "Levantamento técnico incompleto"
+    )
+    partes.append(f"Resultado: {resultado}")
+
+    return "; ".join(partes)[:4000]
+
+
+@app.post(
+    "/chamadas/registrar-conversa-voz",
+    tags=["Chamadas"],
+    status_code=http_status.HTTP_201_CREATED,
+    dependencies=[Depends(validar_api_key)],
+)
+def registrar_conversa_voz(
+    dados: ConversaVozRegistrar,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id
+                FROM comercial.chamadas_ia
+                WHERE provedor = %s
+                  AND chamada_externa_id = %s
+                ORDER BY criado_em DESC
+                LIMIT 1;
+                """,
+                (
+                    dados.provedor,
+                    dados.chamada_externa_id,
+                ),
+            )
+            chamada_existente = cursor.fetchone()
+
+            if chamada_existente is not None:
+                return {
+                    "criada": False,
+                    "idempotente": True,
+                    "interacoes_registradas": 0,
+                    "chamada": obter_chamada_detalhada(
+                        cursor,
+                        chamada_existente["id"],
+                    ),
+                }
+
+            vendedor = obter_vendedor_por_codigo(
+                cursor,
+                dados.vendedor_codigo,
+            )
+            cliente = obter_cliente_por_id(
+                cursor,
+                dados.cliente_id,
+            )
+
+            if (
+                cliente["vendedor_id"] is not None
+                and cliente["vendedor_id"] != vendedor["id"]
+            ):
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail=(
+                        "O cliente está vinculado a outro vendedor. "
+                        "Não foi possível registrar a conversa para "
+                        f"{dados.vendedor_codigo}."
+                    ),
+                )
+
+            agenda = None
+            if dados.agenda_id is not None:
+                agenda = obter_agenda_detalhada(
+                    cursor,
+                    dados.agenda_id,
+                )
+
+                if agenda["cliente_id"] != dados.cliente_id:
+                    raise HTTPException(
+                        status_code=http_status.HTTP_409_CONFLICT,
+                        detail=(
+                            "A agenda informada pertence a outro cliente."
+                        ),
+                    )
+
+                if agenda["vendedor_id"] != vendedor["id"]:
+                    raise HTTPException(
+                        status_code=http_status.HTTP_409_CONFLICT,
+                        detail=(
+                            "A agenda informada pertence a outro vendedor."
+                        ),
+                    )
+
+            transcricao_linhas: list[str] = []
+            for turno in dados.turnos:
+                transcricao_linhas.append(
+                    f"Cliente: {turno.cliente.strip()}"
+                )
+                if turno.agente:
+                    transcricao_linhas.append(
+                        f"{vendedor['nome']}: {turno.agente.strip()}"
+                    )
+
+            transcricao_completa = "\n".join(transcricao_linhas)
+            resumo = dados.resumo or montar_resumo_conversa_voz(
+                dados.estado_comercial,
+                dados.levantamento_completo,
+                dados.resultado,
+            )
+
+            dados_extraidos = {
+                **dados.dados_extraidos,
+                "estado_comercial": dados.estado_comercial,
+                "levantamento_completo": dados.levantamento_completo,
+                "motivo_encerramento": dados.motivo_encerramento,
+                "turnos": [
+                    turno.model_dump()
+                    for turno in dados.turnos
+                ],
+                "modelos": dados.modelos,
+                "origem_integracao": "gateway_voz",
+            }
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.chamadas_ia (
+                    agenda_id,
+                    cliente_id,
+                    vendedor_id,
+                    provedor,
+                    chamada_externa_id,
+                    numero_origem,
+                    numero_destino,
+                    direcao,
+                    status,
+                    inicio_em,
+                    fim_em,
+                    duracao_segundos,
+                    atendida,
+                    transcricao,
+                    resumo,
+                    sentimento,
+                    intencao,
+                    resultado,
+                    custo_telefonia,
+                    custo_ia,
+                    custo_total,
+                    dados_extraidos
+                )
+                VALUES (
+                    %(agenda_id)s,
+                    %(cliente_id)s,
+                    %(vendedor_id)s,
+                    %(provedor)s,
+                    %(chamada_externa_id)s,
+                    %(numero_origem)s,
+                    %(numero_destino)s,
+                    %(direcao)s,
+                    'concluida',
+                    %(inicio_em)s,
+                    %(fim_em)s,
+                    %(duracao_segundos)s,
+                    TRUE,
+                    %(transcricao)s,
+                    %(resumo)s,
+                    %(sentimento)s,
+                    %(intencao)s,
+                    %(resultado)s,
+                    0,
+                    0,
+                    0,
+                    %(dados_extraidos)s
+                )
+                RETURNING id;
+                """,
+                {
+                    "agenda_id": dados.agenda_id,
+                    "cliente_id": dados.cliente_id,
+                    "vendedor_id": vendedor["id"],
+                    "provedor": dados.provedor,
+                    "chamada_externa_id": dados.chamada_externa_id,
+                    "numero_origem": dados.numero_origem,
+                    "numero_destino": dados.numero_destino,
+                    "direcao": dados.direcao,
+                    "inicio_em": dados.inicio_em,
+                    "fim_em": dados.fim_em,
+                    "duracao_segundos": dados.duracao_segundos,
+                    "transcricao": transcricao_completa or None,
+                    "resumo": resumo,
+                    "sentimento": dados.sentimento,
+                    "intencao": dados.intencao,
+                    "resultado": dados.resultado,
+                    "dados_extraidos": Jsonb(dados_extraidos),
+                },
+            )
+            chamada_id = cursor.fetchone()["id"]
+
+            interacoes_registradas = 0
+
+            for turno in dados.turnos:
+                cursor.execute(
+                    """
+                    INSERT INTO comercial.interacoes (
+                        cliente_id,
+                        vendedor_id,
+                        canal,
+                        direcao,
+                        tipo,
+                        mensagem,
+                        intencao,
+                        mensagem_externa_id
+                    )
+                    VALUES (
+                        %s,
+                        %s,
+                        'telefone',
+                        'entrada',
+                        'fala_cliente_ia',
+                        %s,
+                        %s,
+                        %s
+                    );
+                    """,
+                    (
+                        dados.cliente_id,
+                        vendedor["id"],
+                        turno.cliente,
+                        dados.intencao,
+                        (
+                            f"{dados.chamada_externa_id}:"
+                            f"cliente:{turno.numero}"
+                        ),
+                    ),
+                )
+                interacoes_registradas += 1
+
+                if turno.agente:
+                    cursor.execute(
+                        """
+                        INSERT INTO comercial.interacoes (
+                            cliente_id,
+                            vendedor_id,
+                            canal,
+                            direcao,
+                            tipo,
+                            mensagem,
+                            intencao,
+                            mensagem_externa_id
+                        )
+                        VALUES (
+                            %s,
+                            %s,
+                            'telefone',
+                            'saida',
+                            'resposta_vendedor_ia',
+                            %s,
+                            %s,
+                            %s
+                        );
+                        """,
+                        (
+                            dados.cliente_id,
+                            vendedor["id"],
+                            turno.agente,
+                            dados.intencao,
+                            (
+                                f"{dados.chamada_externa_id}:"
+                                f"agente:{turno.numero}"
+                            ),
+                        ),
+                    )
+                    interacoes_registradas += 1
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.interacoes (
+                    cliente_id,
+                    vendedor_id,
+                    canal,
+                    direcao,
+                    tipo,
+                    resumo,
+                    intencao,
+                    mensagem_externa_id
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'telefone',
+                    'saida',
+                    'resumo_chamada_ia',
+                    %s,
+                    %s,
+                    %s
+                );
+                """,
+                (
+                    dados.cliente_id,
+                    vendedor["id"],
+                    resumo,
+                    dados.intencao,
+                    f"{dados.chamada_externa_id}:resumo",
+                ),
+            )
+            interacoes_registradas += 1
+
+            snapshot_triagem = {
+                "chamada_id": str(chamada_id),
+                "chamada_externa_id": dados.chamada_externa_id,
+                "vendedor_codigo": vendedor["codigo"],
+                "resultado": dados.resultado,
+                "levantamento_completo": dados.levantamento_completo,
+                "estado_comercial": dados.estado_comercial,
+                "resumo": resumo,
+                "registrado_em": dados.fim_em.isoformat(),
+            }
+
+            cursor.execute(
+                """
+                UPDATE comercial.clientes
+                SET
+                    vendedor_id = COALESCE(vendedor_id, %s),
+                    ultima_interacao_em = %s,
+                    dados_adicionais = COALESCE(
+                        dados_adicionais,
+                        '{}'::jsonb
+                    ) || jsonb_build_object(
+                        'ultima_triagem_ia',
+                        %s
+                    ),
+                    atualizado_em = NOW()
+                WHERE id = %s;
+                """,
+                (
+                    vendedor["id"],
+                    dados.fim_em,
+                    Jsonb(snapshot_triagem),
+                    dados.cliente_id,
+                ),
+            )
+
+            if agenda is not None:
+                cursor.execute(
+                    """
+                    UPDATE comercial.agendas_comerciais
+                    SET
+                        status = 'concluida',
+                        resultado = %s,
+                        observacao = COALESCE(
+                            NULLIF(observacao, ''),
+                            %s
+                        ),
+                        atualizado_em = NOW()
+                    WHERE id = %s;
+                    """,
+                    (
+                        dados.resultado,
+                        resumo,
+                        dados.agenda_id,
+                    ),
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    vendedor_id,
+                    cliente_id,
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso,
+                    duracao_ms
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'registrar_conversa_voz',
+                    'gateway_voz',
+                    %s,
+                    %s,
+                    TRUE,
+                    %s
+                );
+                """,
+                (
+                    vendedor["id"],
+                    dados.cliente_id,
+                    Jsonb(
+                        {
+                            "chamada_externa_id": (
+                                dados.chamada_externa_id
+                            ),
+                            "agenda_id": (
+                                str(dados.agenda_id)
+                                if dados.agenda_id
+                                else None
+                            ),
+                            "quantidade_turnos": len(dados.turnos),
+                        }
+                    ),
+                    Jsonb(
+                        {
+                            "chamada_id": str(chamada_id),
+                            "resultado": dados.resultado,
+                            "levantamento_completo": (
+                                dados.levantamento_completo
+                            ),
+                            "interacoes_registradas": (
+                                interacoes_registradas
+                            ),
+                        }
+                    ),
+                    dados.duracao_segundos * 1000,
+                ),
+            )
+
+            chamada = obter_chamada_detalhada(
+                cursor,
+                chamada_id,
+            )
+
+        conexao.commit()
+
+    return {
+        "criada": True,
+        "idempotente": False,
+        "interacoes_registradas": interacoes_registradas,
+        "chamada": chamada,
+    }
+
+
 @app.get(
     "/chamadas/{chamada_id}",
     tags=["Chamadas"],
@@ -2378,3 +2894,4 @@ def consultar_teste_interativo_twilio(
         "fala_recebida": resultado["saida"].get("fala_recebida"),
         "registrado_em": resultado["criado_em"],
     }
+
