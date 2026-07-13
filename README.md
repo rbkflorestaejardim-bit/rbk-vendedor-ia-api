@@ -1,10 +1,22 @@
-# RBK Vendedor IA API v0.11.2
+# RBK Vendedor IA API v0.12.1
 
-O endpoint `/olist/produtos/pesquisar` recebeu o parâmetro
-`consultar_estoque=false`.
+A confirmação do carrinho cria uma proposta comercial interna para revisão.
 
-Nesse modo, a pesquisa usa o catálogo local sincronizado e não realiza várias
-chamadas de estoque à Olist. O modo administrativo continua consultando
-estoque por padrão.
+Regras:
 
-Não há migração SQL nesta versão.
+- não cria pedido automaticamente;
+- vendedor padrão obrigatório: MARCIO;
+- vendedor pesquisado na Olist por nome exato;
+- cliente pesquisado exclusivamente por CPF/CNPJ;
+- telefone, WhatsApp e e-mail não são usados para localizar cliente.
+
+Endpoints:
+
+- GET /olist/vendedores/padrao
+- GET /propostas-comerciais
+- GET /propostas-comerciais/{id}
+- PATCH /propostas-comerciais/{id}/revisao
+
+Variável:
+
+OLIST_VENDEDOR_PADRAO_NOME=MARCIO

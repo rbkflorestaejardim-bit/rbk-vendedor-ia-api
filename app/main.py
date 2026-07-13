@@ -64,6 +64,11 @@ OLIST_TIMEOUT_SECONDS = int(
     os.getenv("OLIST_TIMEOUT_SECONDS", "25")
 )
 
+OLIST_VENDEDOR_PADRAO_NOME = os.getenv(
+    "OLIST_VENDEDOR_PADRAO_NOME",
+    "MARCIO",
+).strip() or "MARCIO"
+
 
 ENCARTE_ADMIN_HTML = Path(__file__).with_name(
     "encarte_admin.html"
@@ -385,7 +390,7 @@ def solicitar_token_olist(
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.11.2",
+            "User-Agent": "RBK-Vendedor-IA-API/0.12.1",
         },
     )
 
@@ -623,7 +628,7 @@ def requisicao_get_olist(
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.11.2",
+            "User-Agent": "RBK-Vendedor-IA-API/0.12.1",
         },
     )
 
@@ -1972,6 +1977,19 @@ class OrcamentoIAFinalizar(BaseModel):
 
 
 
+class PropostaComercialRevisar(BaseModel):
+    status: Literal[
+        "aguardando_revisao",
+        "revisada",
+        "cancelada",
+    ] = "revisada"
+    observacao_revisao: str | None = Field(
+        default=None,
+        max_length=4000,
+    )
+
+
+
 class ClienteCriar(BaseModel):
     crm_origem_id: str | None = Field(default=None, max_length=200)
     olist_id: str | None = Field(default=None, max_length=200)
@@ -2421,6 +2439,435 @@ def formatar_produto_encarte(
 
 
 
+def normalizar_nome_olist(
+    valor: str | None,
+) -> str:
+    return normalizar_texto_busca(valor).strip()
+
+
+def resolver_vendedor_padrao_olist() -> dict[str, Any]:
+    nome_alvo = normalizar_nome_olist(
+        OLIST_VENDEDOR_PADRAO_NOME
+    )
+    retorno, limites = requisicao_get_olist(
+        "vendedores",
+        {
+            "nome": OLIST_VENDEDOR_PADRAO_NOME,
+            "limit": 100,
+        },
+    )
+
+    itens = (
+        retorno.get("itens")
+        if isinstance(retorno, dict)
+        else []
+    )
+    if not isinstance(itens, list):
+        itens = []
+
+    exatos: list[dict[str, Any]] = []
+
+    for item in itens:
+        if not isinstance(item, dict):
+            continue
+
+        contato = item.get("contato")
+        if not isinstance(contato, dict):
+            contato = {}
+
+        nomes = {
+            normalizar_nome_olist(
+                contato.get("nome")
+            ),
+            normalizar_nome_olist(
+                contato.get("fantasia")
+            ),
+        }
+        nomes.discard("")
+
+        if nome_alvo in nomes:
+            exatos.append(
+                {
+                    "id": item.get("id"),
+                    "nome": (
+                        contato.get("nome")
+                        or contato.get("fantasia")
+                        or OLIST_VENDEDOR_PADRAO_NOME
+                    ),
+                    "contato": contato,
+                }
+            )
+
+    if len(exatos) == 1 and exatos[0].get("id"):
+        return {
+            "status": "localizado",
+            "id": int(exatos[0]["id"]),
+            "nome": str(exatos[0]["nome"]),
+            "rate_limit": limites,
+        }
+
+    if len(exatos) > 1:
+        return {
+            "status": "duplicado",
+            "detalhe": (
+                "Há mais de um vendedor com o nome exato "
+                f"{OLIST_VENDEDOR_PADRAO_NOME}."
+            ),
+            "resultados": exatos,
+            "rate_limit": limites,
+        }
+
+    return {
+        "status": "nao_localizado",
+        "detalhe": (
+            "O vendedor padrão "
+            f"{OLIST_VENDEDOR_PADRAO_NOME} "
+            "não foi localizado na Olist."
+        ),
+        "rate_limit": limites,
+    }
+
+
+def buscar_cliente_olist_por_documento(
+    documento: str,
+) -> dict[str, Any]:
+    documento_normalizado = normalizar_documento(
+        documento
+    )
+
+    if len(documento_normalizado) not in {11, 14}:
+        return {
+            "status": "documento_invalido",
+            "detalhe": (
+                "O CPF/CNPJ precisa ter 11 ou 14 dígitos."
+            ),
+        }
+
+    retorno, limites = requisicao_get_olist(
+        "contatos",
+        {
+            "cpfCnpj": documento_normalizado,
+            "situacao": "B",
+            "limit": 100,
+        },
+    )
+
+    itens = (
+        retorno.get("itens")
+        if isinstance(retorno, dict)
+        else []
+    )
+    if not isinstance(itens, list):
+        itens = []
+
+    exatos = [
+        item
+        for item in itens
+        if isinstance(item, dict)
+        and normalizar_documento(
+            item.get("cpfCnpj")
+        )
+        == documento_normalizado
+    ]
+
+    if len(exatos) == 1 and exatos[0].get("id"):
+        return {
+            "status": "localizado",
+            "id": int(exatos[0]["id"]),
+            "documento": documento_normalizado,
+            "contato": exatos[0],
+            "rate_limit": limites,
+        }
+
+    if len(exatos) > 1:
+        return {
+            "status": "duplicado",
+            "documento": documento_normalizado,
+            "detalhe": (
+                "Há mais de um contato ativo com o mesmo "
+                "CPF/CNPJ na Olist."
+            ),
+            "resultados": exatos,
+            "rate_limit": limites,
+        }
+
+    return {
+        "status": "nao_localizado",
+        "documento": documento_normalizado,
+        "detalhe": (
+            "Cliente não localizado na Olist pelo CPF/CNPJ."
+        ),
+        "rate_limit": limites,
+    }
+
+
+def preparar_proposta_comercial(
+    orcamento_id: UUID,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            orcamento = obter_orcamento_ia_detalhado(
+                cursor,
+                orcamento_id,
+            )
+
+    numero_proposta = (
+        orcamento.get("numero_proposta")
+        or (
+            "RBK-IA-"
+            + str(orcamento_id).split("-")[0].upper()
+        )
+    )
+
+    documento = normalizar_documento(
+        orcamento.get("cpf_cnpj")
+    )
+
+    vendedor = resolver_vendedor_padrao_olist()
+
+    if len(documento) not in {11, 14}:
+        cliente = {
+            "status": "documento_invalido",
+            "documento": documento or None,
+            "detalhe": (
+                "O cliente não possui CPF/CNPJ válido "
+                "para pesquisa na Olist."
+            ),
+        }
+    else:
+        cliente = buscar_cliente_olist_por_documento(
+            documento
+        )
+
+    if vendedor.get("status") != "localizado":
+        proposta_status = "vendedor_pendente"
+    elif cliente.get("status") == "documento_invalido":
+        proposta_status = "aguardando_documento_cliente"
+    elif cliente.get("status") == "duplicado":
+        proposta_status = "cliente_duplicado_olist"
+    elif cliente.get("status") != "localizado":
+        proposta_status = "cliente_nao_localizado_olist"
+    else:
+        proposta_status = "aguardando_revisao"
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT oportunidade_id
+                FROM comercial.orcamentos_ia
+                WHERE id = %s
+                FOR UPDATE;
+                """,
+                (orcamento_id,),
+            )
+            registro = cursor.fetchone()
+            oportunidade_id = (
+                registro.get("oportunidade_id")
+                if registro
+                else None
+            )
+
+            if oportunidade_id is None:
+                cursor.execute(
+                    """
+                    INSERT INTO comercial.oportunidades (
+                        cliente_id,
+                        vendedor_id,
+                        origem,
+                        etapa,
+                        titulo,
+                        descricao,
+                        valor_estimado,
+                        probabilidade,
+                        produtos,
+                        proxima_acao,
+                        proxima_acao_em
+                    )
+                    VALUES (
+                        %s,
+                        %s,
+                        'agente_voz',
+                        'proposta_comercial',
+                        %s,
+                        %s,
+                        %s,
+                        60,
+                        %s,
+                        'Revisar proposta comercial',
+                        NOW() + INTERVAL '1 day'
+                    )
+                    RETURNING id;
+                    """,
+                    (
+                        orcamento["cliente_id"],
+                        orcamento["vendedor_id"],
+                        f"Proposta comercial {numero_proposta}",
+                        (
+                            "Proposta comercial criada pelo "
+                            "RBK Vendedor IA e aguardando revisão."
+                        ),
+                        orcamento["valor_total"],
+                        Jsonb(orcamento["itens"]),
+                    ),
+                )
+                oportunidade_id = cursor.fetchone()["id"]
+
+            cursor.execute(
+                """
+                UPDATE comercial.orcamentos_ia
+                SET
+                    status = 'aguardando_revisao',
+                    numero_proposta = %s,
+                    proposta_status = %s,
+                    proposta_criada_em = COALESCE(
+                        proposta_criada_em,
+                        NOW()
+                    ),
+                    documento_consulta = %s,
+                    olist_contato_id = %s,
+                    olist_vendedor_id = %s,
+                    olist_vendedor_nome = %s,
+                    cliente_localizado_olist = %s,
+                    oportunidade_id = %s,
+                    atualizado_em = NOW()
+                WHERE id = %s;
+                """,
+                (
+                    numero_proposta,
+                    proposta_status,
+                    documento or None,
+                    (
+                        cliente.get("id")
+                        if cliente.get("status")
+                        == "localizado"
+                        else None
+                    ),
+                    (
+                        vendedor.get("id")
+                        if vendedor.get("status")
+                        == "localizado"
+                        else None
+                    ),
+                    (
+                        vendedor.get("nome")
+                        if vendedor.get("status")
+                        == "localizado"
+                        else OLIST_VENDEDOR_PADRAO_NOME
+                    ),
+                    cliente.get("status") == "localizado",
+                    oportunidade_id,
+                    orcamento_id,
+                ),
+            )
+
+            if cliente.get("status") == "localizado":
+                cursor.execute(
+                    """
+                    UPDATE comercial.clientes
+                    SET
+                        olist_id = %s,
+                        atualizado_em = NOW()
+                    WHERE id = %s;
+                    """,
+                    (
+                        str(cliente["id"]),
+                        orcamento["cliente_id"],
+                    ),
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.interacoes (
+                    cliente_id,
+                    vendedor_id,
+                    canal,
+                    direcao,
+                    tipo,
+                    resumo,
+                    intencao,
+                    mensagem_externa_id
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'sistema',
+                    'saida',
+                    'proposta_comercial_criada',
+                    %s,
+                    'proposta_comercial',
+                    %s
+                );
+                """,
+                (
+                    orcamento["cliente_id"],
+                    orcamento["vendedor_id"],
+                    (
+                        f"Proposta {numero_proposta} criada "
+                        f"com status {proposta_status}. "
+                        f"Vendedor Olist: "
+                        f"{OLIST_VENDEDOR_PADRAO_NOME}."
+                    ),
+                    f"proposta-{orcamento_id}",
+                ),
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    vendedor_id,
+                    cliente_id,
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'criar_proposta_comercial',
+                    'orcamento_ia_confirmado',
+                    %s,
+                    %s,
+                    TRUE
+                );
+                """,
+                (
+                    orcamento["vendedor_id"],
+                    orcamento["cliente_id"],
+                    Jsonb(
+                        {
+                            "orcamento_id": str(orcamento_id),
+                            "documento": documento or None,
+                        }
+                    ),
+                    Jsonb(
+                        {
+                            "numero_proposta": numero_proposta,
+                            "proposta_status": proposta_status,
+                            "cliente_olist": cliente,
+                            "vendedor_olist": vendedor,
+                        }
+                    ),
+                ),
+            )
+
+            detalhado = obter_orcamento_ia_detalhado(
+                cursor,
+                orcamento_id,
+            )
+        conexao.commit()
+
+    return {
+        "status": proposta_status,
+        "numero_proposta": numero_proposta,
+        "cliente_olist": cliente,
+        "vendedor_olist": vendedor,
+        "proposta": detalhado,
+    }
+
+
 def obter_orcamento_ia_detalhado(
     cursor,
     orcamento_id: UUID,
@@ -2436,14 +2883,32 @@ def obter_orcamento_ia_detalhado(
             o.valor_total,
             o.origem,
             o.confirmado_em,
+            o.numero_proposta,
+            o.proposta_status,
+            o.proposta_criada_em,
+            o.documento_consulta,
+            o.olist_contato_id,
+            o.olist_vendedor_id,
+            o.olist_vendedor_nome,
+            o.cliente_localizado_olist,
+            o.observacao_revisao,
+            o.revisado_em,
+            o.oportunidade_id,
             o.criado_em,
             o.atualizado_em,
             c.id AS cliente_id,
+            c.olist_id AS cliente_olist_id,
+            c.tipo_pessoa,
+            c.cpf_cnpj,
             c.razao_social,
             c.nome_fantasia,
             c.nome_contato,
             c.telefone,
             c.whatsapp,
+            c.email,
+            c.cidade,
+            c.uf,
+            c.dados_adicionais AS cliente_dados_adicionais,
             v.id AS vendedor_id,
             v.codigo AS vendedor_codigo,
             v.nome_exibicao AS vendedor_nome
@@ -2697,7 +3162,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RBK Vendedor IA API",
     description="API comercial do projeto piloto RBK Vendedor IA.",
-    version="0.11.2",
+    version="0.12.1",
     lifespan=lifespan,
 )
 
@@ -2708,7 +3173,7 @@ def saude() -> dict[str, str]:
         "status": "ok",
         "servico": "api-comercial",
         "projeto": "RBK Vendedor IA",
-        "versao": "0.11.2",
+        "versao": "0.12.1",
     }
 
 
@@ -4022,7 +4487,7 @@ def consultar_orcamento_ia(
 
 @app.post(
     "/orcamentos-ia/rascunho/finalizar",
-    tags=["Orçamentos IA"],
+    tags=["Propostas Comerciais"],
     dependencies=[Depends(validar_api_key)],
 )
 def finalizar_orcamento_ia(
@@ -4032,7 +4497,7 @@ def finalizar_orcamento_ia(
         with conexao.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, quantidade_linhas, status
+                SELECT id, quantidade_linhas
                 FROM comercial.orcamentos_ia
                 WHERE chamada_externa_id = %s
                 FOR UPDATE;
@@ -4053,8 +4518,14 @@ def finalizar_orcamento_ia(
             ):
                 raise HTTPException(
                     status_code=http_status.HTTP_409_CONFLICT,
-                    detail="O orçamento não possui itens.",
+                    detail="A proposta não possui itens.",
                 )
+
+            novo_status = (
+                "cancelado"
+                if dados.status == "cancelado"
+                else "confirmado"
+            )
 
             cursor.execute(
                 """
@@ -4070,26 +4541,188 @@ def finalizar_orcamento_ia(
                 WHERE id = %s;
                 """,
                 (
-                    dados.status,
-                    dados.status,
+                    novo_status,
+                    novo_status,
                     orcamento["id"],
                 ),
             )
-            detalhado = obter_orcamento_ia_detalhado(
-                cursor,
-                orcamento["id"],
-            )
+            orcamento_id = orcamento["id"]
         conexao.commit()
+
+    if dados.status == "cancelado":
+        with obter_conexao() as conexao:
+            with conexao.cursor() as cursor:
+                detalhado = obter_orcamento_ia_detalhado(
+                    cursor,
+                    orcamento_id,
+                )
+
+        return {
+            "finalizado": True,
+            "orcamento": detalhado,
+            "proposta_comercial": None,
+            "proxima_etapa": None,
+        }
+
+    proposta = preparar_proposta_comercial(
+        orcamento_id
+    )
 
     return {
         "finalizado": True,
-        "orcamento": detalhado,
-        "proxima_etapa": (
-            "criar_orcamento_olist"
-            if dados.status == "confirmado"
-            else None
-        ),
+        "orcamento": proposta["proposta"],
+        "proposta_comercial": proposta,
+        "proxima_etapa": "revisar_proposta_comercial",
     }
+
+
+@app.get(
+    "/olist/vendedores/padrao",
+    tags=["Propostas Comerciais"],
+    dependencies=[Depends(validar_api_key)],
+)
+def consultar_vendedor_padrao_olist() -> dict[str, Any]:
+    return resolver_vendedor_padrao_olist()
+
+
+@app.get(
+    "/propostas-comerciais",
+    tags=["Propostas Comerciais"],
+    dependencies=[Depends(validar_api_key)],
+)
+def listar_propostas_comerciais(
+    status_proposta: str | None = Query(
+        default=None,
+        alias="status",
+    ),
+    limite: int = Query(
+        default=50,
+        ge=1,
+        le=200,
+    ),
+) -> dict[str, Any]:
+    filtros = [
+        "o.numero_proposta IS NOT NULL",
+    ]
+    parametros: list[Any] = []
+
+    if status_proposta:
+        filtros.append("o.proposta_status = %s")
+        parametros.append(status_proposta)
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT
+                    o.id,
+                    o.numero_proposta,
+                    o.status,
+                    o.proposta_status,
+                    o.valor_total,
+                    o.quantidade_linhas,
+                    o.documento_consulta,
+                    o.olist_contato_id,
+                    o.olist_vendedor_id,
+                    o.olist_vendedor_nome,
+                    o.cliente_localizado_olist,
+                    o.proposta_criada_em,
+                    o.revisado_em,
+                    c.razao_social,
+                    c.nome_fantasia,
+                    c.nome_contato,
+                    c.cpf_cnpj,
+                    v.nome_exibicao AS agente_virtual
+                FROM comercial.orcamentos_ia o
+                JOIN comercial.clientes c
+                    ON c.id = o.cliente_id
+                JOIN comercial.vendedores_ia v
+                    ON v.id = o.vendedor_id
+                WHERE {" AND ".join(filtros)}
+                ORDER BY
+                    o.proposta_criada_em DESC NULLS LAST,
+                    o.criado_em DESC
+                LIMIT %s;
+                """,
+                [*parametros, limite],
+            )
+            itens = cursor.fetchall()
+
+    return {
+        "quantidade": len(itens),
+        "itens": itens,
+    }
+
+
+@app.get(
+    "/propostas-comerciais/{proposta_id}",
+    tags=["Propostas Comerciais"],
+    dependencies=[Depends(validar_api_key)],
+)
+def consultar_proposta_comercial(
+    proposta_id: UUID,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            return obter_orcamento_ia_detalhado(
+                cursor,
+                proposta_id,
+            )
+
+
+@app.patch(
+    "/propostas-comerciais/{proposta_id}/revisao",
+    tags=["Propostas Comerciais"],
+    dependencies=[Depends(validar_api_key)],
+)
+def revisar_proposta_comercial(
+    proposta_id: UUID,
+    dados: PropostaComercialRevisar,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE comercial.orcamentos_ia
+                SET
+                    proposta_status = %s,
+                    observacao_revisao = %s,
+                    revisado_em = CASE
+                        WHEN %s = 'revisada'
+                        THEN NOW()
+                        ELSE revisado_em
+                    END,
+                    atualizado_em = NOW()
+                WHERE id = %s
+                  AND numero_proposta IS NOT NULL
+                RETURNING id;
+                """,
+                (
+                    dados.status,
+                    (
+                        dados.observacao_revisao.strip()
+                        if dados.observacao_revisao
+                        else None
+                    ),
+                    dados.status,
+                    proposta_id,
+                ),
+            )
+            atualizado = cursor.fetchone()
+
+            if atualizado is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail="Proposta comercial não encontrada.",
+                )
+
+            detalhado = obter_orcamento_ia_detalhado(
+                cursor,
+                proposta_id,
+            )
+        conexao.commit()
+
+    return detalhado
 
 
 @app.post(
