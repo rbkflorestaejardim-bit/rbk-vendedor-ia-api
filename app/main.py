@@ -385,7 +385,7 @@ def solicitar_token_olist(
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.11.1",
+            "User-Agent": "RBK-Vendedor-IA-API/0.11.2",
         },
     )
 
@@ -623,7 +623,7 @@ def requisicao_get_olist(
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.11.1",
+            "User-Agent": "RBK-Vendedor-IA-API/0.11.2",
         },
     )
 
@@ -1615,6 +1615,7 @@ def pesquisar_produtos_olist(
     marca: str | None,
     modelo: str | None,
     limite: int,
+    consultar_estoque: bool = True,
 ) -> dict[str, Any]:
     inicio = time_module.perf_counter()
     candidatos, catalogo_info = buscar_candidatos_catalogo(
@@ -1704,45 +1705,108 @@ def pesquisar_produtos_olist(
         reverse=True,
     )
 
-    # O estoque é consultado somente para os candidatos mais relevantes.
-    quantidade_enriquecer = min(
-        max(limite * 2, 8),
-        12,
-    )
-    candidatos_estoque = avaliados[:quantidade_enriquecer]
-
-    resultados_enriquecidos: list[dict[str, Any]] = []
     limites_olist: dict[str, str] = {}
 
-    for item in candidatos_estoque:
-        enriquecido, limites_olist = (
-            enriquecer_estoque_catalogo(item)
+    if consultar_estoque:
+        quantidade_enriquecer = min(
+            max(limite * 2, 8),
+            12,
         )
-        resultados_enriquecidos.append(enriquecido)
-        aguardar_rate_limit_olist(limites_olist)
+        candidatos_estoque = avaliados[
+            :quantidade_enriquecer
+        ]
 
-    # Relevância vem antes da disponibilidade. Assim, uma luva preta não
-    # substitui uma luva branca apenas porque existe em estoque.
-    resultados_enriquecidos.sort(
-        key=lambda item: (
-            item["melhor_correspondencia"],
-            item["correspondencia"][
-                "quantidade_preferenciais_encontradas"
-            ],
-            bool(
+        resultados_enriquecidos: list[
+            dict[str, Any]
+        ] = []
+
+        for item in candidatos_estoque:
+            enriquecido, limites_olist = (
+                enriquecer_estoque_catalogo(item)
+            )
+            resultados_enriquecidos.append(
+                enriquecido
+            )
+            aguardar_rate_limit_olist(
+                limites_olist
+            )
+
+        resultados_enriquecidos.sort(
+            key=lambda item: (
+                item["melhor_correspondencia"],
                 item["correspondencia"][
-                    "marca_aliases_encontrados"
-                ]
+                    "quantidade_preferenciais_encontradas"
+                ],
+                bool(
+                    item["correspondencia"][
+                        "marca_aliases_encontrados"
+                    ]
+                ),
+                item["prioridade_comercial"],
+                item["pontuacao"],
+                item["estoque"]["disponivel"] or 0,
+                normalizar_texto_busca(
+                    item["descricao"]
+                ),
             ),
-            item["prioridade_comercial"],
-            item["pontuacao"],
-            item["estoque"]["disponivel"] or 0,
-            normalizar_texto_busca(item["descricao"]),
-        ),
-        reverse=True,
-    )
+            reverse=True,
+        )
 
-    resultados = resultados_enriquecidos[:limite]
+        resultados = resultados_enriquecidos[
+            :limite
+        ]
+    else:
+        resultados = []
+
+        for item in avaliados[:limite]:
+            preco = normalizar_preco(
+                item.get("preco")
+            )
+            preco_promocional = normalizar_preco(
+                item.get("preco_promocional")
+            )
+            preco_efetivo = (
+                preco_promocional
+                or normalizar_preco(
+                    item.get("preco_efetivo")
+                )
+                or preco
+            )
+            tem_preco = bool(
+                preco_efetivo is not None
+                and preco_efetivo > 0
+            )
+
+            resultados.append(
+                {
+                    **item,
+                    "preco": preco,
+                    "preco_promocional": (
+                        preco_promocional
+                    ),
+                    "preco_efetivo": preco_efetivo,
+                    "preco_disponivel": tem_preco,
+                    "tem_estoque": False,
+                    "prioridade_comercial": (
+                        2 if tem_preco else 0
+                    ),
+                    "situacao_comercial": (
+                        "preco_sem_consulta_estoque"
+                        if tem_preco
+                        else "sem_preco"
+                    ),
+                    "estoque": {
+                        "saldo": None,
+                        "reservado": None,
+                        "disponivel": None,
+                        "localizacao": (
+                            item.get("localizacao")
+                        ),
+                        "status": "nao_consultado",
+                        "depositos": [],
+                    },
+                }
+            )
 
     if len(resultados) == 0:
         status_resultado = "nao_encontrado"
@@ -1768,8 +1832,15 @@ def pesquisar_produtos_olist(
                 "palavras_chave_olist_substring"
             ),
             "ordenacao": (
-                "melhor_correspondencia, preço+estoque, relevância"
+                (
+                    "melhor_correspondencia, preço+estoque, relevância"
+                )
+                if consultar_estoque
+                else (
+                    "melhor_correspondencia, preço, relevância"
+                )
             ),
+            "estoque_consultado": consultar_estoque,
             **catalogo_info,
         },
         "quantidade_resultados": len(resultados),
@@ -2626,7 +2697,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RBK Vendedor IA API",
     description="API comercial do projeto piloto RBK Vendedor IA.",
-    version="0.11.1",
+    version="0.11.2",
     lifespan=lifespan,
 )
 
@@ -2637,7 +2708,7 @@ def saude() -> dict[str, str]:
         "status": "ok",
         "servico": "api-comercial",
         "projeto": "RBK Vendedor IA",
-        "versao": "0.11.1",
+        "versao": "0.11.2",
     }
 
 
@@ -3543,6 +3614,13 @@ def pesquisar_produtos(
         max_length=80,
     ),
     limite: int = Query(default=5, ge=1, le=10),
+    consultar_estoque: bool = Query(
+        default=True,
+        description=(
+            "Quando falso, usa somente o catálogo local para "
+            "reduzir a latência do atendimento por voz."
+        ),
+    ),
 ) -> dict[str, Any]:
     resultado = pesquisar_produtos_olist(
         termo=termo,
@@ -3550,6 +3628,7 @@ def pesquisar_produtos(
         marca=marca,
         modelo=modelo,
         limite=limite,
+        consultar_estoque=consultar_estoque,
     )
 
     with obter_conexao() as conexao:

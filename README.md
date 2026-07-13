@@ -1,15 +1,10 @@
-# RBK Vendedor IA API v0.11.1
+# RBK Vendedor IA API v0.11.2
 
-## Correção do fluxo comercial
+O endpoint `/olist/produtos/pesquisar` recebeu o parâmetro
+`consultar_estoque=false`.
 
-Itens que ficaram sem preço, não foram encontrados ou tiveram falha de
-consulta durante uma conversa agora são agrupados em uma pendência comercial,
-mesmo quando a chamada continua e outros produtos entram no orçamento.
-
-A pendência é criada em `comercial.pendencias_comerciais` com o tipo:
-
-```text
-revisar_itens_catalogo
-```
+Nesse modo, a pesquisa usa o catálogo local sincronizado e não realiza várias
+chamadas de estoque à Olist. O modo administrativo continua consultando
+estoque por padrão.
 
 Não há migração SQL nesta versão.
