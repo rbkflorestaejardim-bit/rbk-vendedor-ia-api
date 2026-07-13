@@ -1,22 +1,29 @@
-# RBK Vendedor IA API v0.12.1
+# RBK Vendedor IA API v0.12.2
 
-A confirmação do carrinho cria uma proposta comercial interna para revisão.
+## Correção da localização do vendedor
 
-Regras:
+A API agora reconhece o vendedor padrão por:
 
-- não cria pedido automaticamente;
-- vendedor padrão obrigatório: MARCIO;
-- vendedor pesquisado na Olist por nome exato;
-- cliente pesquisado exclusivamente por CPF/CNPJ;
-- telefone, WhatsApp e e-mail não são usados para localizar cliente.
+1. ID configurado;
+2. código exato;
+3. nome ou fantasia exatos;
+4. nome compatível, como `MARCIO RUBIK`.
 
-Endpoints:
+## Variáveis
 
-- GET /olist/vendedores/padrao
-- GET /propostas-comerciais
-- GET /propostas-comerciais/{id}
-- PATCH /propostas-comerciais/{id}/revisao
-
-Variável:
-
+```env
 OLIST_VENDEDOR_PADRAO_NOME=MARCIO
+OLIST_VENDEDOR_PADRAO_CODIGO=MARCIO
+OLIST_VENDEDOR_PADRAO_ID=
+```
+
+O uso do ID é o método definitivo quando houver nomes semelhantes.
+
+## Diagnóstico
+
+```text
+GET /olist/vendedores/diagnostico
+GET /olist/vendedores/padrao
+```
+
+Não há migração SQL e não há alteração no gateway.

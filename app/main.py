@@ -68,6 +68,14 @@ OLIST_VENDEDOR_PADRAO_NOME = os.getenv(
     "OLIST_VENDEDOR_PADRAO_NOME",
     "MARCIO",
 ).strip() or "MARCIO"
+OLIST_VENDEDOR_PADRAO_CODIGO = os.getenv(
+    "OLIST_VENDEDOR_PADRAO_CODIGO",
+    "MARCIO",
+).strip() or "MARCIO"
+OLIST_VENDEDOR_PADRAO_ID = os.getenv(
+    "OLIST_VENDEDOR_PADRAO_ID",
+    "",
+).strip()
 
 
 ENCARTE_ADMIN_HTML = Path(__file__).with_name(
@@ -390,7 +398,7 @@ def solicitar_token_olist(
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.12.1",
+            "User-Agent": "RBK-Vendedor-IA-API/0.12.2",
         },
     )
 
@@ -628,7 +636,7 @@ def requisicao_get_olist(
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
-            "User-Agent": "RBK-Vendedor-IA-API/0.12.1",
+            "User-Agent": "RBK-Vendedor-IA-API/0.12.2",
         },
     )
 
@@ -2445,85 +2453,278 @@ def normalizar_nome_olist(
     return normalizar_texto_busca(valor).strip()
 
 
+def normalizar_item_vendedor_olist(
+    item: dict[str, Any],
+) -> dict[str, Any]:
+    contato = item.get("contato")
+    if not isinstance(contato, dict):
+        contato = {}
+
+    return {
+        "id": item.get("id"),
+        "nome": contato.get("nome"),
+        "fantasia": contato.get("fantasia"),
+        "codigo": contato.get("codigo"),
+        "cpf_cnpj": contato.get("cpfCnpj"),
+        "email": contato.get("email"),
+        "contato_id": contato.get("id"),
+        "contato": contato,
+    }
+
+
+def listar_vendedores_olist_completo(
+    nome: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    vendedores: list[dict[str, Any]] = []
+    offset = 0
+    limite = 100
+    limites_olist: dict[str, str] = {}
+
+    while True:
+        parametros: dict[str, Any] = {
+            "limit": limite,
+            "offset": offset,
+        }
+        if nome:
+            parametros["nome"] = nome
+
+        retorno, limites_olist = requisicao_get_olist(
+            "vendedores",
+            parametros,
+        )
+
+        itens = (
+            retorno.get("itens")
+            if isinstance(retorno, dict)
+            else []
+        )
+        if not isinstance(itens, list):
+            itens = []
+
+        vendedores.extend(
+            normalizar_item_vendedor_olist(item)
+            for item in itens
+            if isinstance(item, dict)
+        )
+
+        paginacao = (
+            retorno.get("paginacao")
+            if isinstance(retorno, dict)
+            else {}
+        )
+        if not isinstance(paginacao, dict):
+            paginacao = {}
+
+        total = int(
+            paginacao.get("total")
+            or len(vendedores)
+        )
+        offset += len(itens)
+
+        if not itens or offset >= total:
+            break
+
+    return vendedores, limites_olist
+
+
+def pontuar_vendedor_olist(
+    vendedor: dict[str, Any],
+    nome_alvo: str,
+    codigo_alvo: str,
+) -> int:
+    nome = normalizar_nome_olist(
+        vendedor.get("nome")
+    )
+    fantasia = normalizar_nome_olist(
+        vendedor.get("fantasia")
+    )
+    codigo = normalizar_nome_olist(
+        vendedor.get("codigo")
+    )
+
+    if codigo_alvo and codigo == codigo_alvo:
+        return 1000
+
+    if nome == nome_alvo or fantasia == nome_alvo:
+        return 900
+
+    nome_tokens = set(nome.split())
+    fantasia_tokens = set(fantasia.split())
+
+    if (
+        nome_alvo in nome_tokens
+        or nome_alvo in fantasia_tokens
+    ):
+        return 800
+
+    if (
+        nome.startswith(nome_alvo + " ")
+        or fantasia.startswith(nome_alvo + " ")
+    ):
+        return 750
+
+    if (
+        nome_alvo
+        and (
+            nome_alvo in nome
+            or nome_alvo in fantasia
+        )
+    ):
+        return 600
+
+    return 0
+
+
 def resolver_vendedor_padrao_olist() -> dict[str, Any]:
     nome_alvo = normalizar_nome_olist(
         OLIST_VENDEDOR_PADRAO_NOME
     )
-    retorno, limites = requisicao_get_olist(
-        "vendedores",
-        {
-            "nome": OLIST_VENDEDOR_PADRAO_NOME,
-            "limit": 100,
-        },
+    codigo_alvo = normalizar_nome_olist(
+        OLIST_VENDEDOR_PADRAO_CODIGO
     )
 
-    itens = (
-        retorno.get("itens")
-        if isinstance(retorno, dict)
-        else []
-    )
-    if not isinstance(itens, list):
-        itens = []
+    # Caminho mais seguro: ID configurado manualmente.
+    if OLIST_VENDEDOR_PADRAO_ID:
+        if not OLIST_VENDEDOR_PADRAO_ID.isdigit():
+            return {
+                "status": "configuracao_invalida",
+                "detalhe": (
+                    "OLIST_VENDEDOR_PADRAO_ID deve conter "
+                    "somente números."
+                ),
+            }
 
-    exatos: list[dict[str, Any]] = []
+        vendedores, limites = (
+            listar_vendedores_olist_completo()
+        )
+        id_alvo = int(OLIST_VENDEDOR_PADRAO_ID)
 
-    for item in itens:
-        if not isinstance(item, dict):
-            continue
+        encontrados = [
+            vendedor
+            for vendedor in vendedores
+            if vendedor.get("id") == id_alvo
+        ]
 
-        contato = item.get("contato")
-        if not isinstance(contato, dict):
-            contato = {}
+        if len(encontrados) == 1:
+            vendedor = encontrados[0]
+            return {
+                "status": "localizado",
+                "id": id_alvo,
+                "nome": (
+                    vendedor.get("nome")
+                    or vendedor.get("fantasia")
+                    or OLIST_VENDEDOR_PADRAO_NOME
+                ),
+                "codigo": vendedor.get("codigo"),
+                "criterio": "id_configurado",
+                "vendedor": vendedor,
+                "rate_limit": limites,
+            }
 
-        nomes = {
-            normalizar_nome_olist(
-                contato.get("nome")
-            ),
-            normalizar_nome_olist(
-                contato.get("fantasia")
-            ),
-        }
-        nomes.discard("")
-
-        if nome_alvo in nomes:
-            exatos.append(
-                {
-                    "id": item.get("id"),
-                    "nome": (
-                        contato.get("nome")
-                        or contato.get("fantasia")
-                        or OLIST_VENDEDOR_PADRAO_NOME
-                    ),
-                    "contato": contato,
-                }
-            )
-
-    if len(exatos) == 1 and exatos[0].get("id"):
         return {
-            "status": "localizado",
-            "id": int(exatos[0]["id"]),
-            "nome": str(exatos[0]["nome"]),
+            "status": "nao_localizado",
+            "detalhe": (
+                "O ID configurado em "
+                "OLIST_VENDEDOR_PADRAO_ID não foi encontrado."
+            ),
+            "id_configurado": id_alvo,
             "rate_limit": limites,
         }
 
-    if len(exatos) > 1:
+    # Primeiro tenta o filtro parcial documentado pela Olist.
+    vendedores, limites = listar_vendedores_olist_completo(
+        OLIST_VENDEDOR_PADRAO_NOME
+    )
+
+    # Caso o filtro não retorne nada, carrega a lista completa para
+    # permitir correspondência também pelo código.
+    if not vendedores:
+        vendedores, limites = (
+            listar_vendedores_olist_completo()
+        )
+
+    candidatos: list[dict[str, Any]] = []
+
+    for vendedor in vendedores:
+        pontuacao = pontuar_vendedor_olist(
+            vendedor,
+            nome_alvo,
+            codigo_alvo,
+        )
+        if pontuacao <= 0:
+            continue
+
+        candidatos.append(
+            {
+                **vendedor,
+                "pontuacao": pontuacao,
+            }
+        )
+
+    candidatos.sort(
+        key=lambda item: (
+            item["pontuacao"],
+            int(item.get("id") or 0),
+        ),
+        reverse=True,
+    )
+
+    if candidatos:
+        melhor_pontuacao = candidatos[0]["pontuacao"]
+        melhores = [
+            candidato
+            for candidato in candidatos
+            if candidato["pontuacao"]
+            == melhor_pontuacao
+        ]
+
+        if len(melhores) == 1 and melhores[0].get("id"):
+            vendedor = melhores[0]
+            return {
+                "status": "localizado",
+                "id": int(vendedor["id"]),
+                "nome": (
+                    vendedor.get("nome")
+                    or vendedor.get("fantasia")
+                    or OLIST_VENDEDOR_PADRAO_NOME
+                ),
+                "codigo": vendedor.get("codigo"),
+                "criterio": (
+                    "codigo_exato"
+                    if melhor_pontuacao == 1000
+                    else (
+                        "nome_exato"
+                        if melhor_pontuacao == 900
+                        else "nome_compativel"
+                    )
+                ),
+                "vendedor": vendedor,
+                "rate_limit": limites,
+            }
+
         return {
             "status": "duplicado",
             "detalhe": (
-                "Há mais de um vendedor com o nome exato "
-                f"{OLIST_VENDEDOR_PADRAO_NOME}."
+                "Mais de um vendedor corresponde ao padrão "
+                f"{OLIST_VENDEDOR_PADRAO_NOME}. "
+                "Configure OLIST_VENDEDOR_PADRAO_ID."
             ),
-            "resultados": exatos,
+            "resultados": melhores,
             "rate_limit": limites,
         }
 
     return {
         "status": "nao_localizado",
         "detalhe": (
-            "O vendedor padrão "
-            f"{OLIST_VENDEDOR_PADRAO_NOME} "
-            "não foi localizado na Olist."
+            "Nenhum vendedor correspondeu ao nome ou código "
+            f"{OLIST_VENDEDOR_PADRAO_NOME}."
         ),
+        "configuracao": {
+            "nome": OLIST_VENDEDOR_PADRAO_NOME,
+            "codigo": OLIST_VENDEDOR_PADRAO_CODIGO,
+            "id": OLIST_VENDEDOR_PADRAO_ID or None,
+        },
+        "vendedores_retornados": vendedores[:100],
         "rate_limit": limites,
     }
 
@@ -3162,7 +3363,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="RBK Vendedor IA API",
     description="API comercial do projeto piloto RBK Vendedor IA.",
-    version="0.12.1",
+    version="0.12.2",
     lifespan=lifespan,
 )
 
@@ -3173,7 +3374,7 @@ def saude() -> dict[str, str]:
         "status": "ok",
         "servico": "api-comercial",
         "projeto": "RBK Vendedor IA",
-        "versao": "0.12.1",
+        "versao": "0.12.2",
     }
 
 
@@ -4583,6 +4784,37 @@ def finalizar_orcamento_ia(
 )
 def consultar_vendedor_padrao_olist() -> dict[str, Any]:
     return resolver_vendedor_padrao_olist()
+
+
+
+@app.get(
+    "/olist/vendedores/diagnostico",
+    tags=["Propostas Comerciais"],
+    dependencies=[Depends(validar_api_key)],
+)
+def diagnosticar_vendedores_olist(
+    nome: str | None = Query(
+        default=None,
+        description=(
+            "Filtro parcial opcional pelo nome do vendedor."
+        ),
+    ),
+) -> dict[str, Any]:
+    vendedores, limites = (
+        listar_vendedores_olist_completo(nome)
+    )
+
+    return {
+        "quantidade": len(vendedores),
+        "filtro_nome": nome,
+        "configuracao_atual": {
+            "nome": OLIST_VENDEDOR_PADRAO_NOME,
+            "codigo": OLIST_VENDEDOR_PADRAO_CODIGO,
+            "id": OLIST_VENDEDOR_PADRAO_ID or None,
+        },
+        "itens": vendedores,
+        "rate_limit": limites,
+    }
 
 
 @app.get(
