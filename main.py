@@ -94,3 +94,8260 @@ STATUS_AGENDA = {
     "concluida",
     "reagendada",
     "cancelada",
+    "sem_resposta",
+}
+
+STATUS_CHAMADA = {
+    "iniciada",
+    "em_andamento",
+    "concluida",
+    "nao_atendida",
+    "ocupado",
+    "falha",
+    "cancelada",
+}
+
+STATUS_PENDENCIA_COMERCIAL = {
+    "pendente",
+    "em_analise",
+    "aguardando_reposicao",
+    "aguardando_catalogo",
+    "resolvida",
+    "cancelada",
+}
+
+STATUS_ORCAMENTO_IA = {
+    "rascunho",
+    "aguardando_confirmacao",
+    "confirmado",
+    "enviado_olist",
+    "cancelado",
+}
+
+FUSO_PROJETO = ZoneInfo("America/Sao_Paulo")
+
+STATUS_TWILIO_PARA_INTERNO = {
+    "queued": "iniciada",
+    "initiated": "iniciada",
+    "ringing": "em_andamento",
+    "in-progress": "em_andamento",
+    "completed": "concluida",
+    "busy": "ocupado",
+    "failed": "falha",
+    "no-answer": "nao_atendida",
+    "canceled": "cancelada",
+}
+
+
+def obter_conexao():
+    if not DATABASE_URL:
+        raise RuntimeError("A variável DATABASE_URL não foi configurada.")
+
+    return psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+        connect_timeout=10,
+    )
+
+
+def validar_api_key(
+    chave_recebida: str | None = Security(api_key_header),
+) -> None:
+    if not API_KEY:
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A API ainda não possui chave de acesso configurada.",
+        )
+
+    if not chave_recebida or not hmac.compare_digest(chave_recebida, API_KEY):
+        raise HTTPException(
+            status_code=http_status.HTTP_401_UNAUTHORIZED,
+            detail="Chave de acesso inválida ou ausente.",
+        )
+
+
+def normalizar_documento(valor: str | None) -> str | None:
+    if valor is None:
+        return None
+    documento = re.sub(r"\D", "", valor)
+    return documento or None
+
+
+def obter_vendedor_por_codigo(cursor, codigo: str) -> dict[str, Any]:
+    cursor.execute(
+        """
+        SELECT id, codigo, nome, ativo, uf_principal
+        FROM comercial.vendedores_ia
+        WHERE codigo = %s;
+        """,
+        (codigo.upper(),),
+    )
+    vendedor = cursor.fetchone()
+
+    if vendedor is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Vendedor não encontrado.",
+        )
+
+    if not vendedor["ativo"]:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="O vendedor informado está inativo.",
+        )
+
+    return vendedor
+
+
+def obter_cliente_por_id(cursor, cliente_id: UUID) -> dict[str, Any]:
+    cursor.execute(
+        """
+        SELECT
+            c.*,
+            v.codigo AS vendedor_codigo,
+            v.nome_exibicao AS vendedor_nome
+        FROM comercial.clientes c
+        LEFT JOIN comercial.vendedores_ia v
+            ON v.id = c.vendedor_id
+        WHERE c.id = %s;
+        """,
+        (cliente_id,),
+    )
+    cliente = cursor.fetchone()
+
+    if cliente is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Cliente não encontrado.",
+        )
+
+    return cliente
+
+
+def obter_agenda_detalhada(cursor, agenda_id: UUID) -> dict[str, Any]:
+    cursor.execute(
+        """
+        SELECT
+            a.*,
+            c.cpf_cnpj,
+            c.razao_social,
+            c.nome_fantasia,
+            c.nome_contato,
+            c.telefone,
+            c.whatsapp,
+            c.email,
+            c.cidade,
+            c.uf,
+            c.status AS cliente_status,
+            c.opt_out,
+            c.bloqueado,
+            c.dados_adicionais,
+            v.codigo AS vendedor_codigo,
+            v.nome_exibicao AS vendedor_nome
+        FROM comercial.agendas_comerciais a
+        JOIN comercial.clientes c
+            ON c.id = a.cliente_id
+        JOIN comercial.vendedores_ia v
+            ON v.id = a.vendedor_id
+        WHERE a.id = %s;
+        """,
+        (agenda_id,),
+    )
+    agenda = cursor.fetchone()
+
+    if agenda is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Agenda não encontrada.",
+        )
+
+    return agenda
+
+
+def obter_chamada_detalhada(cursor, chamada_id: UUID) -> dict[str, Any]:
+    cursor.execute(
+        """
+        SELECT
+            ch.*,
+            a.data_agenda,
+            a.status AS agenda_status,
+            c.cpf_cnpj,
+            c.razao_social,
+            c.nome_fantasia,
+            c.nome_contato,
+            c.telefone,
+            c.whatsapp,
+            c.cidade,
+            c.uf,
+            v.codigo AS vendedor_codigo,
+            v.nome_exibicao AS vendedor_nome
+        FROM comercial.chamadas_ia ch
+        LEFT JOIN comercial.agendas_comerciais a
+            ON a.id = ch.agenda_id
+        JOIN comercial.clientes c
+            ON c.id = ch.cliente_id
+        JOIN comercial.vendedores_ia v
+            ON v.id = ch.vendedor_id
+        WHERE ch.id = %s;
+        """,
+        (chamada_id,),
+    )
+    chamada = cursor.fetchone()
+
+    if chamada is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Chamada não encontrada.",
+        )
+
+    return chamada
+
+
+def validar_numero_e164(numero: str) -> str:
+    numero_normalizado = numero.strip()
+
+    if not re.fullmatch(r"\+[1-9]\d{7,14}", numero_normalizado):
+        raise ValueError(
+            "Use o número no formato internacional E.164, por exemplo +5541999999999."
+        )
+
+    return numero_normalizado
+
+
+def mascarar_telefone(numero: str) -> str:
+    if len(numero) <= 6:
+        return "***"
+    return f"{numero[:4]}{'*' * max(len(numero) - 8, 3)}{numero[-4:]}"
+
+
+def obter_cliente_twilio() -> TwilioClient:
+    return TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+
+async def validar_webhook_twilio(request: Request) -> dict[str, str]:
+    assinatura = request.headers.get("X-Twilio-Signature", "")
+    formulario = await request.form()
+    dados = {str(chave): str(valor) for chave, valor in formulario.multi_items()}
+
+    url_assinada = f"{TWILIO_BASE_URL}{request.url.path}"
+    if request.url.query:
+        url_assinada = f"{url_assinada}?{request.url.query}"
+
+    validador = RequestValidator(TWILIO_AUTH_TOKEN)
+
+    if not assinatura or not validador.validate(
+        url_assinada,
+        dados,
+        assinatura,
+    ):
+        raise HTTPException(
+            status_code=http_status.HTTP_403_FORBIDDEN,
+            detail="Assinatura do webhook Twilio inválida.",
+        )
+
+    return dados
+
+
+def validar_configuracao_olist(
+    exigir_credenciais: bool = True,
+) -> None:
+    variaveis = {
+        "OLIST_API_BASE_URL": OLIST_API_BASE_URL,
+        "OLIST_AUTH_URL": OLIST_AUTH_URL,
+        "OLIST_TOKEN_URL": OLIST_TOKEN_URL,
+        "OLIST_REDIRECT_URI": OLIST_REDIRECT_URI,
+        "OLIST_TOKEN_CRYPTO_KEY": OLIST_TOKEN_CRYPTO_KEY,
+    }
+
+    if exigir_credenciais:
+        variaveis.update(
+            {
+                "OLIST_CLIENT_ID": OLIST_CLIENT_ID,
+                "OLIST_CLIENT_SECRET": OLIST_CLIENT_SECRET,
+            }
+        )
+
+    ausentes = [
+        nome
+        for nome, valor in variaveis.items()
+        if not valor
+    ]
+    if ausentes:
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Integração Olist incompleta. Variáveis ausentes: "
+                + ", ".join(ausentes)
+            ),
+        )
+
+
+def solicitar_token_olist(
+    dados_formulario: dict[str, str],
+) -> dict[str, Any]:
+    validar_configuracao_olist()
+
+    corpo = urllib.parse.urlencode(
+        dados_formulario
+    ).encode("utf-8")
+
+    requisicao = urllib.request.Request(
+        OLIST_TOKEN_URL,
+        data=corpo,
+        method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": "RBK-Vendedor-IA-API/0.12.3",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(
+            requisicao,
+            timeout=OLIST_TIMEOUT_SECONDS,
+        ) as resposta:
+            conteudo = resposta.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+            retorno = json.loads(conteudo)
+    except urllib.error.HTTPError as erro:
+        corpo_erro = erro.read().decode(
+            "utf-8",
+            errors="replace",
+        )
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"Olist OAuth retornou HTTP {erro.code}: "
+                f"{corpo_erro[:1000]}"
+            ),
+        ) from erro
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        json.JSONDecodeError,
+    ) as erro:
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail=f"Falha na comunicação OAuth com a Olist: {erro}",
+        ) from erro
+
+    if not retorno.get("access_token"):
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail="A Olist não retornou access_token.",
+        )
+
+    return retorno
+
+
+def salvar_tokens_olist(
+    cursor,
+    retorno: dict[str, Any],
+) -> dict[str, Any]:
+    agora = datetime.now(timezone.utc)
+    expira_em = agora + timedelta(
+        seconds=max(int(retorno.get("expires_in", 14400)), 60)
+    )
+    refresh_expira_em = agora + timedelta(
+        seconds=max(
+            int(retorno.get("refresh_expires_in", 86400)),
+            60,
+        )
+    )
+
+    access_token = str(retorno["access_token"])
+    refresh_token = str(retorno.get("refresh_token") or "")
+
+    if not refresh_token:
+        cursor.execute(
+            """
+            SELECT
+                pgp_sym_decrypt(
+                    refresh_token_cifrado,
+                    %s
+                ) AS refresh_token
+            FROM comercial.olist_oauth_tokens
+            WHERE id = 1;
+            """,
+            (OLIST_TOKEN_CRYPTO_KEY,),
+        )
+        existente = cursor.fetchone()
+        if existente:
+            refresh_token = existente["refresh_token"]
+
+    if not refresh_token:
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail="A Olist não retornou refresh_token.",
+        )
+
+    cursor.execute(
+        """
+        INSERT INTO comercial.olist_oauth_tokens (
+            id,
+            access_token_cifrado,
+            refresh_token_cifrado,
+            token_type,
+            scope,
+            expira_em,
+            refresh_expira_em,
+            atualizado_em
+        )
+        VALUES (
+            1,
+            pgp_sym_encrypt(%s, %s),
+            pgp_sym_encrypt(%s, %s),
+            %s,
+            %s,
+            %s,
+            %s,
+            NOW()
+        )
+        ON CONFLICT (id) DO UPDATE
+        SET
+            access_token_cifrado = EXCLUDED.access_token_cifrado,
+            refresh_token_cifrado = EXCLUDED.refresh_token_cifrado,
+            token_type = EXCLUDED.token_type,
+            scope = EXCLUDED.scope,
+            expira_em = EXCLUDED.expira_em,
+            refresh_expira_em = EXCLUDED.refresh_expira_em,
+            atualizado_em = NOW();
+        """,
+        (
+            access_token,
+            OLIST_TOKEN_CRYPTO_KEY,
+            refresh_token,
+            OLIST_TOKEN_CRYPTO_KEY,
+            str(retorno.get("token_type") or "Bearer"),
+            str(retorno.get("scope") or OLIST_SCOPE),
+            expira_em,
+            refresh_expira_em,
+        ),
+    )
+
+    return {
+        "token_type": str(retorno.get("token_type") or "Bearer"),
+        "scope": str(retorno.get("scope") or OLIST_SCOPE),
+        "expira_em": expira_em,
+        "refresh_expira_em": refresh_expira_em,
+    }
+
+
+def carregar_tokens_olist(cursor) -> dict[str, Any] | None:
+    validar_configuracao_olist()
+
+    cursor.execute(
+        """
+        SELECT
+            pgp_sym_decrypt(
+                access_token_cifrado,
+                %s
+            ) AS access_token,
+            pgp_sym_decrypt(
+                refresh_token_cifrado,
+                %s
+            ) AS refresh_token,
+            token_type,
+            scope,
+            expira_em,
+            refresh_expira_em,
+            atualizado_em
+        FROM comercial.olist_oauth_tokens
+        WHERE id = 1;
+        """,
+        (
+            OLIST_TOKEN_CRYPTO_KEY,
+            OLIST_TOKEN_CRYPTO_KEY,
+        ),
+    )
+    return cursor.fetchone()
+
+
+def obter_access_token_olist(
+    forcar_renovacao: bool = False,
+) -> str:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            tokens = carregar_tokens_olist(cursor)
+
+            if tokens is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail=(
+                        "A integração Olist ainda não foi autorizada. "
+                        "Execute /olist/oauth/iniciar."
+                    ),
+                )
+
+            agora = datetime.now(timezone.utc)
+            margem = timedelta(seconds=90)
+
+            if (
+                not forcar_renovacao
+                and tokens["expira_em"] > agora + margem
+            ):
+                return tokens["access_token"]
+
+            if tokens["refresh_expira_em"] <= agora + margem:
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail=(
+                        "O refresh token da Olist expirou. "
+                        "Autorize novamente em /olist/oauth/iniciar."
+                    ),
+                )
+
+            retorno = solicitar_token_olist(
+                {
+                    "grant_type": "refresh_token",
+                    "client_id": OLIST_CLIENT_ID,
+                    "client_secret": OLIST_CLIENT_SECRET,
+                    "refresh_token": tokens["refresh_token"],
+                }
+            )
+            salvar_tokens_olist(cursor, retorno)
+        conexao.commit()
+
+    return str(retorno["access_token"])
+
+
+def requisicao_get_olist(
+    caminho: str,
+    parametros: dict[str, Any] | None = None,
+    repetir_apos_401: bool = True,
+) -> tuple[Any, dict[str, str]]:
+    token = obter_access_token_olist()
+    url = f"{OLIST_API_BASE_URL}/{caminho.lstrip('/')}"
+
+    parametros_limpos = {
+        chave: valor
+        for chave, valor in (parametros or {}).items()
+        if valor not in (None, "")
+    }
+    if parametros_limpos:
+        url += "?" + urllib.parse.urlencode(parametros_limpos)
+
+    requisicao = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "RBK-Vendedor-IA-API/0.12.3",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(
+            requisicao,
+            timeout=OLIST_TIMEOUT_SECONDS,
+        ) as resposta:
+            conteudo = resposta.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+            dados = json.loads(conteudo)
+            limites = {
+                "limite": resposta.headers.get(
+                    "X-RateLimit-Limit",
+                    "",
+                ),
+                "restante": resposta.headers.get(
+                    "X-RateLimit-Remaining",
+                    "",
+                ),
+                "reset_segundos": resposta.headers.get(
+                    "X-RateLimit-Reset",
+                    "",
+                ),
+            }
+            return dados, limites
+
+    except urllib.error.HTTPError as erro:
+        corpo_erro = erro.read().decode(
+            "utf-8",
+            errors="replace",
+        )
+
+        if erro.code == 401 and repetir_apos_401:
+            obter_access_token_olist(forcar_renovacao=True)
+            return requisicao_get_olist(
+                caminho,
+                parametros,
+                repetir_apos_401=False,
+            )
+
+        if erro.code == 429:
+            raise HTTPException(
+                status_code=http_status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=(
+                    "Limite de requisições da Olist atingido. "
+                    f"Retorno: {corpo_erro[:1000]}"
+                ),
+            ) from erro
+
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"Olist API retornou HTTP {erro.code}: "
+                f"{corpo_erro[:1200]}"
+            ),
+        ) from erro
+
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        json.JSONDecodeError,
+    ) as erro:
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail=f"Falha na comunicação com a Olist: {erro}",
+        ) from erro
+
+
+def normalizar_texto_busca(valor: Any) -> str:
+    texto = unicodedata.normalize(
+        "NFKD",
+        str(valor or ""),
+    )
+    texto = "".join(
+        caractere
+        for caractere in texto
+        if not unicodedata.combining(caractere)
+    )
+    texto = texto.casefold()
+    texto = re.sub(r"[^a-z0-9]+", " ", texto)
+    return re.sub(r"\s+", " ", texto).strip()
+
+
+def tokens_busca(valor: Any) -> list[str]:
+    ignorar = {
+        "a",
+        "o",
+        "as",
+        "os",
+        "de",
+        "da",
+        "do",
+        "das",
+        "dos",
+        "para",
+        "por",
+        "com",
+        "um",
+        "uma",
+        "uns",
+        "umas",
+        "preciso",
+        "quero",
+        "gostaria",
+        "procuro",
+        "procurando",
+        "comprar",
+        "tem",
+        "teria",
+        "voces",
+        "vocês",
+        "me",
+        "ver",
+        "favor",
+        "produto",
+        "peca",
+        "peça",
+        "epi",
+    }
+    return [
+        token
+        for token in normalizar_texto_busca(valor).split()
+        if token not in ignorar
+    ]
+
+
+def aliases_marca(marca: str | None) -> set[str]:
+    marca_normalizada = normalizar_texto_busca(marca)
+    tokens = set(tokens_busca(marca))
+
+    mapa_aliases: dict[str, set[str]] = {
+        "stihl": {"stihl", "st"},
+        "husqvarna": {"husqvarna", "hq", "husq"},
+        "toyama": {"toyama", "ty"},
+        "nakashi": {"nakashi", "nk"},
+        "tekna": {"tekna", "tk"},
+        "echo": {"echo"},
+        "makita": {"makita"},
+        "kawashima": {"kawashima"},
+        "briggs stratton": {
+            "briggs",
+            "stratton",
+            "briggsstratton",
+            "bs",
+        },
+    }
+
+    if marca_normalizada in mapa_aliases:
+        tokens.update(mapa_aliases[marca_normalizada])
+
+    for nome, aliases in mapa_aliases.items():
+        if marca_normalizada in aliases:
+            tokens.update(aliases)
+            tokens.update(tokens_busca(nome))
+
+    return {alias for alias in tokens if alias}
+
+
+def componentes_modelo(
+    modelo: str | None,
+) -> dict[str, set[str]]:
+    modelo_normalizado = normalizar_texto_busca(modelo)
+    prefixos: set[str] = set()
+    numeros: set[str] = set()
+
+    for segmento in re.findall(
+        r"[a-z]+|\d+[a-z]*",
+        modelo_normalizado.replace(" ", ""),
+    ):
+        if segmento.isalpha():
+            prefixos.add(segmento)
+            continue
+
+        numero = re.search(r"\d+", segmento)
+        if numero:
+            numeros.add(numero.group(0))
+        prefixos.update(re.findall(r"[a-z]+", segmento))
+
+    for token in modelo_normalizado.split():
+        if token.isalpha():
+            prefixos.add(token)
+        numeros.update(re.findall(r"\d+", token))
+
+    return {
+        "prefixos": prefixos,
+        "numeros": numeros,
+    }
+
+
+def normalizar_preco(
+    valor: Any,
+) -> float | None:
+    if valor in (None, ""):
+        return None
+
+    try:
+        if isinstance(valor, str):
+            valor_limpo = valor.strip()
+            if "," in valor_limpo:
+                valor_limpo = (
+                    valor_limpo
+                    .replace(".", "")
+                    .replace(",", ".")
+                )
+            numero = float(valor_limpo)
+        else:
+            numero = float(valor)
+    except (TypeError, ValueError):
+        return None
+
+    return round(numero, 2) if numero > 0 else None
+
+
+def normalizar_quantidade(
+    valor: Any,
+) -> float | None:
+    if valor in (None, ""):
+        return None
+
+    try:
+        return float(valor)
+    except (TypeError, ValueError):
+        return None
+
+
+def preco_efetivo_item_olist(
+    item: dict[str, Any],
+) -> float | None:
+    precos = item.get("precos")
+    if not isinstance(precos, dict):
+        precos = {}
+
+    promocional = normalizar_preco(
+        precos.get("precoPromocional")
+    )
+    normal = normalizar_preco(
+        precos.get("preco")
+    )
+    return promocional or normal
+
+
+def aguardar_rate_limit_olist(
+    limites: dict[str, str],
+) -> None:
+    try:
+        restante = int(limites.get("restante") or 999)
+        reset = int(limites.get("reset_segundos") or 0)
+    except (TypeError, ValueError):
+        return
+
+    if restante <= 2 and reset > 0:
+        time_module.sleep(min(reset + 1, 65))
+
+
+def sincronizar_catalogo_olist(
+    max_paginas: int,
+) -> dict[str, Any]:
+    inicio = time_module.perf_counter()
+    lote = uuid4()
+    itens_catalogo: dict[int, dict[str, Any]] = {}
+    limites_olist: dict[str, str] = {}
+    offset = 0
+    limite_pagina = 100
+    paginas = 0
+    total_informado = 0
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO comercial.olist_catalogo_sincronizacoes (
+                    id,
+                    status,
+                    inicio_em
+                )
+                VALUES (%s, 'em_andamento', NOW());
+                """,
+                (lote,),
+            )
+        conexao.commit()
+
+    try:
+        while paginas < max_paginas:
+            retorno, limites_olist = requisicao_get_olist(
+                "produtos",
+                {
+                    "situacao": "A",
+                    "limit": limite_pagina,
+                    "offset": offset,
+                },
+            )
+            paginas += 1
+
+            pagina_itens = retorno.get("itens") or []
+            paginacao = retorno.get("paginacao") or {}
+            total_informado = int(
+                paginacao.get("total") or total_informado
+            )
+
+            for item in pagina_itens:
+                produto_id = item.get("id")
+                descricao = str(
+                    item.get("descricao") or ""
+                ).strip()
+
+                if produto_id is None or not descricao:
+                    continue
+
+                descricao_normalizada = normalizar_texto_busca(
+                    descricao
+                )
+                sku = str(item.get("sku") or "").strip()
+                tokens = sorted(
+                    set(
+                        tokens_busca(descricao)
+                        + tokens_busca(sku)
+                    )
+                )
+                precos = item.get("precos")
+                if not isinstance(precos, dict):
+                    precos = {}
+
+                preco = normalizar_preco(
+                    precos.get("preco")
+                )
+                preco_promocional = normalizar_preco(
+                    precos.get("precoPromocional")
+                )
+                preco_efetivo = (
+                    preco_promocional or preco
+                )
+
+                itens_catalogo[int(produto_id)] = {
+                    "id_olist": int(produto_id),
+                    "sku": sku or None,
+                    "descricao": descricao,
+                    "descricao_normalizada": (
+                        descricao_normalizada
+                    ),
+                    "tokens": tokens,
+                    "unidade": item.get("unidade"),
+                    "gtin": item.get("gtin"),
+                    "situacao": "A",
+                    "preco": preco,
+                    "preco_promocional": preco_promocional,
+                    "preco_efetivo": preco_efetivo,
+                    "preco_disponivel": (
+                        preco_efetivo is not None
+                    ),
+                    "localizacao": (
+                        item.get("estoque") or {}
+                    ).get("localizacao"),
+                    "data_criacao_olist": item.get(
+                        "dataCriacao"
+                    ),
+                    "data_alteracao_olist": item.get(
+                        "dataAlteracao"
+                    ),
+                    "dados": item,
+                }
+
+            offset += limite_pagina
+            aguardar_rate_limit_olist(limites_olist)
+
+            if (
+                not pagina_itens
+                or (
+                    total_informado > 0
+                    and offset >= total_informado
+                )
+            ):
+                break
+
+        sincronizacao_completa = bool(
+            total_informado == 0
+            or len(itens_catalogo) >= total_informado
+        )
+
+        with obter_conexao() as conexao:
+            with conexao.cursor() as cursor:
+                for item in itens_catalogo.values():
+                    cursor.execute(
+                        """
+                        INSERT INTO comercial.olist_catalogo_produtos (
+                            id_olist,
+                            sku,
+                            descricao,
+                            descricao_normalizada,
+                            tokens,
+                            unidade,
+                            gtin,
+                            situacao,
+                            preco,
+                            preco_promocional,
+                            preco_efetivo,
+                            preco_disponivel,
+                            localizacao,
+                            data_criacao_olist,
+                            data_alteracao_olist,
+                            dados,
+                            ativo,
+                            lote_sincronizacao,
+                            sincronizado_em
+                        )
+                        VALUES (
+                            %(id_olist)s,
+                            %(sku)s,
+                            %(descricao)s,
+                            %(descricao_normalizada)s,
+                            %(tokens)s,
+                            %(unidade)s,
+                            %(gtin)s,
+                            %(situacao)s,
+                            %(preco)s,
+                            %(preco_promocional)s,
+                            %(preco_efetivo)s,
+                            %(preco_disponivel)s,
+                            %(localizacao)s,
+                            %(data_criacao_olist)s,
+                            %(data_alteracao_olist)s,
+                            %(dados)s,
+                            TRUE,
+                            %(lote)s,
+                            NOW()
+                        )
+                        ON CONFLICT (id_olist) DO UPDATE
+                        SET
+                            sku = EXCLUDED.sku,
+                            descricao = EXCLUDED.descricao,
+                            descricao_normalizada = (
+                                EXCLUDED.descricao_normalizada
+                            ),
+                            tokens = EXCLUDED.tokens,
+                            unidade = EXCLUDED.unidade,
+                            gtin = EXCLUDED.gtin,
+                            situacao = EXCLUDED.situacao,
+                            preco = EXCLUDED.preco,
+                            preco_promocional = (
+                                EXCLUDED.preco_promocional
+                            ),
+                            preco_efetivo = EXCLUDED.preco_efetivo,
+                            preco_disponivel = (
+                                EXCLUDED.preco_disponivel
+                            ),
+                            localizacao = EXCLUDED.localizacao,
+                            data_criacao_olist = (
+                                EXCLUDED.data_criacao_olist
+                            ),
+                            data_alteracao_olist = (
+                                EXCLUDED.data_alteracao_olist
+                            ),
+                            dados = EXCLUDED.dados,
+                            ativo = TRUE,
+                            lote_sincronizacao = (
+                                EXCLUDED.lote_sincronizacao
+                            ),
+                            sincronizado_em = NOW();
+                        """,
+                        {
+                            **item,
+                            "dados": Jsonb(item["dados"]),
+                            "lote": lote,
+                        },
+                    )
+
+                if sincronizacao_completa:
+                    cursor.execute(
+                        """
+                        UPDATE comercial.olist_catalogo_produtos
+                        SET
+                            ativo = FALSE,
+                            sincronizado_em = NOW()
+                        WHERE ativo = TRUE
+                          AND lote_sincronizacao <> %s;
+                        """,
+                        (lote,),
+                    )
+
+                duracao_ms = int(
+                    (
+                        time_module.perf_counter() - inicio
+                    ) * 1000
+                )
+                cursor.execute(
+                    """
+                    UPDATE comercial.olist_catalogo_sincronizacoes
+                    SET
+                        status = %s,
+                        fim_em = NOW(),
+                        paginas = %s,
+                        total_informado_olist = %s,
+                        total_recebido = %s,
+                        total_gravado = %s,
+                        duracao_ms = %s,
+                        rate_limit = %s
+                    WHERE id = %s;
+                    """,
+                    (
+                        (
+                            "concluida"
+                            if sincronizacao_completa
+                            else "parcial"
+                        ),
+                        paginas,
+                        total_informado,
+                        len(itens_catalogo),
+                        len(itens_catalogo),
+                        duracao_ms,
+                        Jsonb(limites_olist),
+                        lote,
+                    ),
+                )
+            conexao.commit()
+
+        return {
+            "sincronizacao_id": lote,
+            "status": (
+                "concluida"
+                if sincronizacao_completa
+                else "parcial"
+            ),
+            "paginas": paginas,
+            "total_informado_olist": total_informado,
+            "total_recebido": len(itens_catalogo),
+            "total_gravado": len(itens_catalogo),
+            "duracao_ms": duracao_ms,
+            "rate_limit": limites_olist,
+        }
+
+    except Exception as erro:
+        with obter_conexao() as conexao:
+            with conexao.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE comercial.olist_catalogo_sincronizacoes
+                    SET
+                        status = 'erro',
+                        fim_em = NOW(),
+                        paginas = %s,
+                        total_informado_olist = %s,
+                        total_recebido = %s,
+                        erro = %s,
+                        duracao_ms = %s,
+                        rate_limit = %s
+                    WHERE id = %s;
+                    """,
+                    (
+                        paginas,
+                        total_informado,
+                        len(itens_catalogo),
+                        str(erro)[:4000],
+                        int(
+                            (
+                                time_module.perf_counter()
+                                - inicio
+                            ) * 1000
+                        ),
+                        Jsonb(limites_olist),
+                        lote,
+                    ),
+                )
+            conexao.commit()
+        raise
+
+
+MATERIAIS_BUSCA_BASE = {
+    "malha",
+    "latex",
+    "raspa",
+    "vaqueta",
+    "nitrilica",
+    "nitrilo",
+    "nylon",
+    "couro",
+    "algodao",
+    "pvc",
+}
+
+PREFIXOS_MODELO_NAO_OBRIGATORIOS = {
+    "ms",
+    "fs",
+    "st",
+    "hq",
+}
+
+
+def palavra_chave_contida(
+    descricao_normalizada: str,
+    palavra: str,
+) -> bool:
+    palavra_normalizada = normalizar_texto_busca(palavra)
+    if not palavra_normalizada:
+        return True
+
+    if palavra_normalizada in descricao_normalizada:
+        return True
+
+    descricao_compacta = descricao_normalizada.replace(" ", "")
+    palavra_compacta = palavra_normalizada.replace(" ", "")
+    return bool(
+        palavra_compacta
+        and palavra_compacta in descricao_compacta
+    )
+
+
+def identificar_palavras_chave_busca(
+    termo: str | None,
+    produto: str | None,
+    marca: str | None,
+    modelo: str | None,
+) -> dict[str, list[str]]:
+    termo_tokens = tokens_busca(termo)
+    produto_tokens = tokens_busca(produto)
+    marca_tokens = set(tokens_busca(marca))
+    marca_tokens.update(aliases_marca(marca))
+
+    modelo_partes = componentes_modelo(modelo)
+    numeros_modelo = sorted(modelo_partes["numeros"])
+    prefixos_modelo = set(modelo_partes["prefixos"])
+
+    obrigatorias: list[str] = []
+    vistas: set[str] = set()
+
+    def adicionar_obrigatoria(valor: str) -> None:
+        chave = normalizar_texto_busca(valor)
+        if chave and chave not in vistas:
+            vistas.add(chave)
+            obrigatorias.append(chave)
+
+    for token in produto_tokens:
+        adicionar_obrigatoria(token)
+
+    for numero in numeros_modelo:
+        adicionar_obrigatoria(numero)
+
+    # Números, medidas e cilindradas digitados pelo cliente funcionam como
+    # palavras-chave do Olist: 170, 160, 43cc, 35cm etc.
+    for token in termo_tokens:
+        if any(caractere.isdigit() for caractere in token):
+            adicionar_obrigatoria(token)
+
+    # Quando o produto é amplo, o material é uma palavra-base útil.
+    # Ex.: "luva malha", "luva raspa", "luva latex".
+    if len(produto_tokens) <= 1:
+        for token in termo_tokens:
+            if token in MATERIAIS_BUSCA_BASE:
+                adicionar_obrigatoria(token)
+
+    # Se o LLM não separou o produto, usa as duas primeiras palavras úteis
+    # do pedido como busca-base.
+    if not obrigatorias:
+        for token in termo_tokens[:2]:
+            adicionar_obrigatoria(token)
+
+    representadas = set(obrigatorias)
+    representadas.update(marca_tokens)
+    representadas.update(prefixos_modelo)
+    representadas.update(PREFIXOS_MODELO_NAO_OBRIGATORIOS)
+
+    preferenciais: list[str] = []
+    preferencias_vistas: set[str] = set()
+
+    for token in termo_tokens:
+        chave = normalizar_texto_busca(token)
+        if (
+            not chave
+            or chave in representadas
+            or chave in preferencias_vistas
+        ):
+            continue
+
+        preferencias_vistas.add(chave)
+        preferenciais.append(chave)
+
+    return {
+        "obrigatorias": obrigatorias,
+        "preferenciais": preferenciais,
+        "aliases_marca": sorted(marca_tokens),
+    }
+
+
+def avaliar_correspondencia_catalogo(
+    item: dict[str, Any],
+    termo: str | None,
+    produto: str | None,
+    marca: str | None,
+    modelo: str | None,
+) -> dict[str, Any]:
+    descricao = normalizar_texto_busca(
+        item.get("descricao")
+    )
+    tokens_descricao = set(descricao.split())
+
+    palavras = identificar_palavras_chave_busca(
+        termo,
+        produto,
+        marca,
+        modelo,
+    )
+    obrigatorias = palavras["obrigatorias"]
+    preferenciais = palavras["preferenciais"]
+    aliases = palavras["aliases_marca"]
+
+    obrigatorias_encontradas = [
+        palavra
+        for palavra in obrigatorias
+        if palavra_chave_contida(descricao, palavra)
+    ]
+    base_corresponde = bool(
+        obrigatorias
+        and len(obrigatorias_encontradas)
+        == len(obrigatorias)
+    )
+
+    preferenciais_encontradas = [
+        palavra
+        for palavra in preferenciais
+        if palavra_chave_contida(descricao, palavra)
+    ]
+
+    aliases_encontrados = [
+        alias
+        for alias in aliases
+        if alias in tokens_descricao
+    ]
+    marca_corresponde = bool(
+        not aliases or aliases_encontrados
+    )
+
+    produto_normalizado = normalizar_texto_busca(produto)
+    frase_produto_corresponde = bool(
+        produto_normalizado
+        and produto_normalizado in descricao
+    )
+
+    pontuacao_preferencias = len(
+        preferenciais_encontradas
+    )
+    pontuacao_relevancia = (
+        len(obrigatorias_encontradas) * 100
+        + pontuacao_preferencias * 40
+        + (30 if aliases_encontrados else 0)
+        + (20 if frase_produto_corresponde else 0)
+    )
+
+    return {
+        "pontuacao": pontuacao_relevancia,
+        "pontuacao_relevancia": pontuacao_relevancia,
+        "correspondencia_exata": base_corresponde,
+        "correspondencia_palavras": base_corresponde,
+        "produto_corresponde": base_corresponde,
+        "marca_corresponde": marca_corresponde,
+        "modelo_corresponde": True,
+        "palavras_chave_obrigatorias": obrigatorias,
+        "palavras_chave_encontradas": (
+            obrigatorias_encontradas
+        ),
+        "palavras_preferenciais": preferenciais,
+        "palavras_preferenciais_encontradas": (
+            preferenciais_encontradas
+        ),
+        "quantidade_preferenciais": len(preferenciais),
+        "quantidade_preferenciais_encontradas": (
+            pontuacao_preferencias
+        ),
+        "marca_aliases_encontrados": aliases_encontrados,
+        "frase_produto_corresponde": (
+            frase_produto_corresponde
+        ),
+    }
+
+
+def buscar_candidatos_catalogo(
+    termo: str | None,
+    produto: str | None,
+    marca: str | None,
+    modelo: str | None,
+    limite_candidatos: int = 2000,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    palavras = identificar_palavras_chave_busca(
+        termo,
+        produto,
+        marca,
+        modelo,
+    )
+    obrigatorias = palavras["obrigatorias"]
+
+    if not obrigatorias:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Não foi possível extrair palavras-chave "
+                "para pesquisar o catálogo."
+            ),
+        )
+
+    # A palavra mais longa reduz o volume inicial. As demais são validadas
+    # por substring em Python, reproduzindo o modo "palavras-chave" do ERP.
+    ancora = max(obrigatorias, key=len)
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM comercial.olist_catalogo_produtos
+                WHERE ativo = TRUE;
+                """
+            )
+            total_catalogo = cursor.fetchone()["total"]
+
+            cursor.execute(
+                """
+                SELECT
+                    MAX(sincronizado_em) AS sincronizado_em
+                FROM comercial.olist_catalogo_produtos
+                WHERE ativo = TRUE;
+                """
+            )
+            sincronizado_em = cursor.fetchone()[
+                "sincronizado_em"
+            ]
+
+            if total_catalogo == 0:
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail=(
+                        "O catálogo local da Olist está vazio. "
+                        "Execute POST /olist/catalogo/sincronizar."
+                    ),
+                )
+
+            cursor.execute(
+                """
+                SELECT
+                    id_olist AS id,
+                    sku,
+                    descricao,
+                    descricao_normalizada,
+                    tokens,
+                    unidade,
+                    gtin,
+                    preco,
+                    preco_promocional,
+                    preco_efetivo,
+                    preco_disponivel,
+                    localizacao,
+                    sincronizado_em
+                FROM comercial.olist_catalogo_produtos
+                WHERE ativo = TRUE
+                  AND descricao_normalizada LIKE %s
+                ORDER BY
+                    preco_disponivel DESC,
+                    descricao
+                LIMIT %s;
+                """,
+                (
+                    f"%{ancora}%",
+                    limite_candidatos,
+                ),
+            )
+            candidatos_iniciais = cursor.fetchall()
+
+    candidatos = [
+        item
+        for item in candidatos_iniciais
+        if all(
+            palavra_chave_contida(
+                item["descricao_normalizada"],
+                palavra,
+            )
+            for palavra in obrigatorias
+        )
+    ]
+
+    return candidatos, {
+        "total_catalogo_ativo": total_catalogo,
+        "catalogo_sincronizado_em": sincronizado_em,
+        "modo_correspondencia": (
+            "todas_as_palavras_base_como_substring"
+        ),
+        "palavra_ancora": ancora,
+        "palavras_chave_obrigatorias": obrigatorias,
+        "palavras_preferenciais": palavras[
+            "preferenciais"
+        ],
+        "aliases_marca": palavras["aliases_marca"],
+        "quantidade_candidatos_iniciais": len(
+            candidatos_iniciais
+        ),
+        "quantidade_candidatos_filtrados": len(
+            candidatos
+        ),
+    }
+
+
+def enriquecer_estoque_catalogo(
+    item: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, str]]:
+    retorno, limites = requisicao_get_olist(
+        f"estoque/{item['id']}",
+    )
+    estoque = (
+        retorno.get("estoque")
+        if isinstance(retorno, dict)
+        and isinstance(retorno.get("estoque"), dict)
+        else retorno
+    )
+    if not isinstance(estoque, dict):
+        estoque = {}
+
+    saldo = normalizar_quantidade(
+        estoque.get("saldo")
+    )
+    reservado = normalizar_quantidade(
+        estoque.get("reservado")
+    )
+    disponivel = normalizar_quantidade(
+        estoque.get("disponivel")
+    )
+
+    preco = normalizar_preco(item.get("preco"))
+    preco_promocional = normalizar_preco(
+        item.get("preco_promocional")
+    )
+    preco_efetivo = (
+        preco_promocional
+        or normalizar_preco(item.get("preco_efetivo"))
+        or preco
+    )
+    tem_preco = preco_efetivo is not None
+    tem_estoque = bool(
+        disponivel is not None and disponivel > 0
+    )
+
+    if tem_preco and tem_estoque:
+        prioridade = 3
+        situacao = "preco_e_estoque"
+    elif tem_preco:
+        prioridade = 2
+        situacao = "somente_preco"
+    elif tem_estoque:
+        prioridade = 1
+        situacao = "somente_estoque"
+    else:
+        prioridade = 0
+        situacao = "sem_preco_e_sem_estoque"
+
+    return (
+        {
+            **item,
+            "preco": preco,
+            "preco_promocional": preco_promocional,
+            "preco_efetivo": preco_efetivo,
+            "preco_disponivel": tem_preco,
+            "tem_estoque": tem_estoque,
+            "prioridade_comercial": prioridade,
+            "situacao_comercial": situacao,
+            "estoque": {
+                "saldo": saldo,
+                "reservado": reservado,
+                "disponivel": disponivel,
+                "localizacao": (
+                    estoque.get("localizacao")
+                    or item.get("localizacao")
+                ),
+                "status": (
+                    "disponivel"
+                    if tem_estoque
+                    else (
+                        "sem_estoque"
+                        if disponivel is not None
+                        else "nao_informado"
+                    )
+                ),
+                "depositos": estoque.get("depositos") or [],
+            },
+        },
+        limites,
+    )
+
+
+
+
+def _normalizar_chave_olist(valor: Any) -> str:
+    return re.sub(
+        r"[^a-z0-9]",
+        "",
+        normalizar_texto_busca(valor),
+    )
+
+
+def _extrair_objeto_produto_olist(retorno: Any) -> dict[str, Any]:
+    if not isinstance(retorno, dict):
+        return {}
+
+    candidatos = [
+        retorno.get("produto"),
+        retorno.get("item"),
+        retorno.get("data"),
+        retorno.get("dados"),
+    ]
+
+    for candidato in candidatos:
+        if not isinstance(candidato, dict):
+            continue
+
+        produto_interno = candidato.get("produto")
+        if isinstance(produto_interno, dict):
+            return produto_interno
+
+        return candidato
+
+    return retorno
+
+
+def _buscar_valor_olist(
+    dados: Any,
+    *chaves: str,
+) -> Any:
+    alvos = {
+        _normalizar_chave_olist(chave)
+        for chave in chaves
+        if chave
+    }
+    if not alvos:
+        return None
+
+    def visitar(valor: Any) -> Any:
+        if isinstance(valor, dict):
+            for chave, conteudo in valor.items():
+                if (
+                    _normalizar_chave_olist(chave) in alvos
+                    and conteudo not in (None, "", [], {})
+                ):
+                    return conteudo
+
+            for conteudo in valor.values():
+                encontrado = visitar(conteudo)
+                if encontrado not in (None, "", [], {}):
+                    return encontrado
+
+        elif isinstance(valor, list):
+            for conteudo in valor:
+                encontrado = visitar(conteudo)
+                if encontrado not in (None, "", [], {}):
+                    return encontrado
+
+        return None
+
+    return visitar(dados)
+
+
+def _texto_valor_olist(valor: Any) -> str | None:
+    if valor in (None, "", [], {}):
+        return None
+
+    if isinstance(valor, str):
+        texto = valor.strip()
+        return texto or None
+
+    if isinstance(valor, (int, float)):
+        return str(valor)
+
+    if isinstance(valor, dict):
+        for chave in (
+            "descricao",
+            "nome",
+            "titulo",
+            "label",
+            "valor",
+        ):
+            conteudo = valor.get(chave)
+            texto = _texto_valor_olist(conteudo)
+            if texto:
+                return texto
+
+    return None
+
+
+def _coletar_urls_midia_olist(dados: Any) -> list[str]:
+    encontrados: list[str] = []
+    vistos: set[str] = set()
+    termos_midia = {
+        "imagem",
+        "imagens",
+        "image",
+        "images",
+        "foto",
+        "fotos",
+        "anexo",
+        "anexos",
+        "media",
+        "midia",
+        "midias",
+    }
+    extensoes_imagem = (
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".webp",
+        ".gif",
+        ".bmp",
+        ".avif",
+    )
+
+    def visitar(valor: Any, caminho: tuple[str, ...]) -> None:
+        if len(encontrados) >= 30:
+            return
+
+        if isinstance(valor, dict):
+            for chave, conteudo in valor.items():
+                visitar(
+                    conteudo,
+                    (*caminho, _normalizar_chave_olist(chave)),
+                )
+            return
+
+        if isinstance(valor, list):
+            for conteudo in valor:
+                visitar(conteudo, caminho)
+            return
+
+        if not isinstance(valor, str):
+            return
+
+        url = valor.strip()
+        if not url.lower().startswith(("http://", "https://")):
+            return
+
+        caminho_texto = " ".join(caminho)
+        contexto_midia = any(
+            termo in caminho_texto
+            for termo in termos_midia
+        )
+        caminho_url = urllib.parse.urlparse(url).path.casefold()
+        parece_imagem = caminho_url.endswith(extensoes_imagem)
+
+        if not contexto_midia and not parece_imagem:
+            return
+
+        if url in vistos:
+            return
+
+        vistos.add(url)
+        encontrados.append(url)
+
+    visitar(dados, tuple())
+    return encontrados
+
+
+def _caracteristicas_marketing_olist(
+    dados: Any,
+) -> dict[str, Any]:
+    mapa = {
+        "ncm": ("ncm",),
+        "cest": ("cest",),
+        "origem": ("origem",),
+        "garantia": ("garantia", "garantiaProduto"),
+        "peso_liquido": ("pesoLiquido", "peso_liquido"),
+        "peso_bruto": ("pesoBruto", "peso_bruto"),
+        "altura_embalagem": (
+            "alturaEmbalagem",
+            "altura_embalagem",
+        ),
+        "largura_embalagem": (
+            "larguraEmbalagem",
+            "largura_embalagem",
+        ),
+        "comprimento_embalagem": (
+            "comprimentoEmbalagem",
+            "comprimento_embalagem",
+        ),
+        "diametro_embalagem": (
+            "diametroEmbalagem",
+            "diametro_embalagem",
+        ),
+        "tipo_produto": (
+            "tipoProduto",
+            "tipo_produto",
+            "classeProduto",
+            "classe_produto",
+        ),
+    }
+
+    resultado: dict[str, Any] = {}
+    for campo, chaves in mapa.items():
+        valor = _buscar_valor_olist(dados, *chaves)
+        if valor not in (None, "", [], {}):
+            resultado[campo] = valor
+
+    atributos = _buscar_valor_olist(
+        dados,
+        "atributos",
+        "caracteristicas",
+        "especificacoes",
+    )
+    if atributos not in (None, "", [], {}):
+        resultado["atributos"] = atributos
+
+    variacoes = _buscar_valor_olist(
+        dados,
+        "variacoes",
+        "variations",
+    )
+    if variacoes not in (None, "", [], {}):
+        resultado["variacoes"] = variacoes
+
+    kit = _buscar_valor_olist(
+        dados,
+        "kit",
+        "componentes",
+    )
+    if kit not in (None, "", [], {}):
+        resultado["kit"] = kit
+
+    return resultado
+
+
+def pesquisar_produtos_olist(
+    termo: str | None,
+    produto: str | None,
+    marca: str | None,
+    modelo: str | None,
+    limite: int,
+    consultar_estoque: bool = True,
+) -> dict[str, Any]:
+    inicio = time_module.perf_counter()
+    candidatos, catalogo_info = buscar_candidatos_catalogo(
+        termo,
+        produto,
+        marca,
+        modelo,
+    )
+
+    avaliados: list[dict[str, Any]] = []
+
+    for item in candidatos:
+        correspondencia = avaliar_correspondencia_catalogo(
+            item,
+            termo,
+            produto,
+            marca,
+            modelo,
+        )
+        if not correspondencia["correspondencia_palavras"]:
+            continue
+
+        avaliados.append(
+            {
+                **item,
+                "pontuacao": correspondencia[
+                    "pontuacao_relevancia"
+                ],
+                "correspondencia": correspondencia,
+            }
+        )
+
+    if avaliados:
+        melhor_chave = max(
+            (
+                item["correspondencia"][
+                    "quantidade_preferenciais_encontradas"
+                ],
+                bool(
+                    item["correspondencia"][
+                        "marca_aliases_encontrados"
+                    ]
+                ),
+                item["correspondencia"][
+                    "pontuacao_relevancia"
+                ],
+            )
+            for item in avaliados
+        )
+    else:
+        melhor_chave = None
+
+    for item in avaliados:
+        chave_item = (
+            item["correspondencia"][
+                "quantidade_preferenciais_encontradas"
+            ],
+            bool(
+                item["correspondencia"][
+                    "marca_aliases_encontrados"
+                ]
+            ),
+            item["correspondencia"][
+                "pontuacao_relevancia"
+            ],
+        )
+        item["melhor_correspondencia"] = bool(
+            melhor_chave is not None
+            and chave_item == melhor_chave
+        )
+
+    avaliados.sort(
+        key=lambda item: (
+            item["melhor_correspondencia"],
+            item["correspondencia"][
+                "quantidade_preferenciais_encontradas"
+            ],
+            bool(
+                item["correspondencia"][
+                    "marca_aliases_encontrados"
+                ]
+            ),
+            item.get("preco_disponivel") or False,
+            item["pontuacao"],
+            normalizar_texto_busca(item["descricao"]),
+        ),
+        reverse=True,
+    )
+
+    limites_olist: dict[str, str] = {}
+
+    if consultar_estoque:
+        quantidade_enriquecer = min(
+            max(limite * 2, 8),
+            12,
+        )
+        candidatos_estoque = avaliados[
+            :quantidade_enriquecer
+        ]
+
+        resultados_enriquecidos: list[
+            dict[str, Any]
+        ] = []
+
+        for item in candidatos_estoque:
+            enriquecido, limites_olist = (
+                enriquecer_estoque_catalogo(item)
+            )
+            resultados_enriquecidos.append(
+                enriquecido
+            )
+            aguardar_rate_limit_olist(
+                limites_olist
+            )
+
+        resultados_enriquecidos.sort(
+            key=lambda item: (
+                item["melhor_correspondencia"],
+                item["correspondencia"][
+                    "quantidade_preferenciais_encontradas"
+                ],
+                bool(
+                    item["correspondencia"][
+                        "marca_aliases_encontrados"
+                    ]
+                ),
+                item["prioridade_comercial"],
+                item["pontuacao"],
+                item["estoque"]["disponivel"] or 0,
+                normalizar_texto_busca(
+                    item["descricao"]
+                ),
+            ),
+            reverse=True,
+        )
+
+        resultados = resultados_enriquecidos[
+            :limite
+        ]
+    else:
+        resultados = []
+
+        for item in avaliados[:limite]:
+            preco = normalizar_preco(
+                item.get("preco")
+            )
+            preco_promocional = normalizar_preco(
+                item.get("preco_promocional")
+            )
+            preco_efetivo = (
+                preco_promocional
+                or normalizar_preco(
+                    item.get("preco_efetivo")
+                )
+                or preco
+            )
+            tem_preco = bool(
+                preco_efetivo is not None
+                and preco_efetivo > 0
+            )
+
+            resultados.append(
+                {
+                    **item,
+                    "preco": preco,
+                    "preco_promocional": (
+                        preco_promocional
+                    ),
+                    "preco_efetivo": preco_efetivo,
+                    "preco_disponivel": tem_preco,
+                    "tem_estoque": False,
+                    "prioridade_comercial": (
+                        2 if tem_preco else 0
+                    ),
+                    "situacao_comercial": (
+                        "preco_sem_consulta_estoque"
+                        if tem_preco
+                        else "sem_preco"
+                    ),
+                    "estoque": {
+                        "saldo": None,
+                        "reservado": None,
+                        "disponivel": None,
+                        "localizacao": (
+                            item.get("localizacao")
+                        ),
+                        "status": "nao_consultado",
+                        "depositos": [],
+                    },
+                }
+            )
+
+    if len(resultados) == 0:
+        status_resultado = "nao_encontrado"
+    elif len(resultados) == 1:
+        status_resultado = "encontrado"
+    else:
+        status_resultado = "multiplos_resultados"
+
+    quantidade_melhores = sum(
+        1
+        for item in avaliados
+        if item["melhor_correspondencia"]
+    )
+
+    return {
+        "status": status_resultado,
+        "consulta": {
+            "termo": termo,
+            "produto": produto,
+            "marca": marca,
+            "modelo": modelo,
+            "modo_busca": (
+                "palavras_chave_olist_substring"
+            ),
+            "ordenacao": (
+                (
+                    "melhor_correspondencia, preço+estoque, relevância"
+                )
+                if consultar_estoque
+                else (
+                    "melhor_correspondencia, preço, relevância"
+                )
+            ),
+            "estoque_consultado": consultar_estoque,
+            **catalogo_info,
+        },
+        "quantidade_resultados": len(resultados),
+        "quantidade_compativeis_localizados": len(avaliados),
+        "quantidade_melhor_correspondencia": (
+            quantidade_melhores
+        ),
+        "resultados": resultados,
+        "rate_limit": limites_olist,
+        "duracao_ms": int(
+            (
+                time_module.perf_counter() - inicio
+            ) * 1000
+        ),
+    }
+
+
+class EncarteConfiguracaoAtualizar(BaseModel):
+    titulo: str = Field(
+        min_length=3,
+        max_length=150,
+    )
+    inicio_vigencia: date
+    fim_vigencia: date
+    ativo: bool = True
+
+    @model_validator(mode="after")
+    def validar_periodo(self):
+        if self.fim_vigencia < self.inicio_vigencia:
+            raise ValueError(
+                "A data final não pode ser anterior à data inicial."
+            )
+        return self
+
+
+class EncarteProdutoAdicionar(BaseModel):
+    sku: str = Field(
+        min_length=1,
+        max_length=80,
+    )
+    prioridade: int = Field(
+        default=3,
+        ge=1,
+        le=5,
+    )
+    observacao: str | None = Field(
+        default=None,
+        max_length=500,
+    )
+
+    @field_validator("sku")
+    @classmethod
+    def normalizar_sku(cls, valor: str) -> str:
+        return valor.strip()
+
+
+class EncarteProdutoAtualizar(BaseModel):
+    prioridade: int | None = Field(
+        default=None,
+        ge=1,
+        le=5,
+    )
+    ativo: bool | None = None
+    observacao: str | None = Field(
+        default=None,
+        max_length=500,
+    )
+
+
+
+class OrcamentoIAItemAdicionar(BaseModel):
+    chamada_externa_id: str = Field(
+        min_length=8,
+        max_length=120,
+    )
+    cliente_id: UUID
+    vendedor_codigo: str = Field(
+        min_length=2,
+        max_length=40,
+    )
+    sku: str = Field(
+        min_length=1,
+        max_length=80,
+    )
+    quantidade: float = Field(
+        gt=0,
+        le=100000,
+    )
+    origem: Literal[
+        "catalogo",
+        "encarte",
+        "complementar",
+    ] = "catalogo"
+    disponibilidade: Literal[
+        "pronta_entrega",
+        "sob_consulta",
+        "nao_considerada",
+        "nao_informada",
+    ] = "nao_informada"
+    dados_adicionais: dict[str, Any] = Field(
+        default_factory=dict,
+    )
+
+    @field_validator(
+        "chamada_externa_id",
+        "vendedor_codigo",
+        "sku",
+    )
+    @classmethod
+    def limpar_texto_obrigatorio(cls, valor: str) -> str:
+        return valor.strip()
+
+
+class OrcamentoIAFinalizar(BaseModel):
+    chamada_externa_id: str = Field(
+        min_length=8,
+        max_length=120,
+    )
+    status: Literal[
+        "aguardando_confirmacao",
+        "confirmado",
+        "cancelado",
+    ] = "confirmado"
+
+    @field_validator("chamada_externa_id")
+    @classmethod
+    def limpar_chamada_externa_id(cls, valor: str) -> str:
+        return valor.strip()
+
+
+
+class PropostaComercialRevisar(BaseModel):
+    status: Literal[
+        "aguardando_revisao",
+        "revisada",
+        "cancelada",
+    ] = "revisada"
+    observacao_revisao: str | None = Field(
+        default=None,
+        max_length=4000,
+    )
+
+
+
+class ClienteCriar(BaseModel):
+    crm_origem_id: str | None = Field(default=None, max_length=200)
+    olist_id: str | None = Field(default=None, max_length=200)
+    tipo_pessoa: Literal["CPF", "CNPJ"] | None = None
+    cpf_cnpj: str | None = Field(default=None, max_length=20)
+    razao_social: str | None = Field(default=None, max_length=200)
+    nome_fantasia: str | None = Field(default=None, max_length=200)
+    nome_contato: str | None = Field(default=None, max_length=150)
+    telefone: str | None = Field(default=None, max_length=30)
+    whatsapp: str | None = Field(default=None, max_length=30)
+    email: str | None = Field(default=None, max_length=180)
+    cidade: str | None = Field(default=None, max_length=120)
+    uf: str | None = Field(default=None, min_length=2, max_length=2)
+    vendedor_codigo: str | None = Field(default=None, max_length=40)
+    status: str = Field(default="novo", max_length=40)
+    origem: str = Field(default="crm_ligacoes", max_length=40)
+    dados_adicionais: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("cpf_cnpj")
+    @classmethod
+    def validar_documento(cls, valor: str | None) -> str | None:
+        return normalizar_documento(valor)
+
+    @field_validator("uf")
+    @classmethod
+    def validar_uf(cls, valor: str | None) -> str | None:
+        return valor.upper() if valor else None
+
+    @field_validator("vendedor_codigo")
+    @classmethod
+    def validar_codigo_vendedor(cls, valor: str | None) -> str | None:
+        return valor.upper() if valor else None
+
+    @model_validator(mode="after")
+    def validar_identificacao(self):
+        if not any([self.razao_social, self.nome_fantasia, self.nome_contato]):
+            raise ValueError(
+                "Informe ao menos razão social, nome fantasia ou nome do contato."
+            )
+        return self
+
+
+class ClienteAtualizar(BaseModel):
+    crm_origem_id: str | None = Field(default=None, max_length=200)
+    olist_id: str | None = Field(default=None, max_length=200)
+    tipo_pessoa: Literal["CPF", "CNPJ"] | None = None
+    cpf_cnpj: str | None = Field(default=None, max_length=20)
+    razao_social: str | None = Field(default=None, max_length=200)
+    nome_fantasia: str | None = Field(default=None, max_length=200)
+    nome_contato: str | None = Field(default=None, max_length=150)
+    telefone: str | None = Field(default=None, max_length=30)
+    whatsapp: str | None = Field(default=None, max_length=30)
+    email: str | None = Field(default=None, max_length=180)
+    cidade: str | None = Field(default=None, max_length=120)
+    uf: str | None = Field(default=None, min_length=2, max_length=2)
+    vendedor_codigo: str | None = Field(default=None, max_length=40)
+    status: str | None = Field(default=None, max_length=40)
+    origem: str | None = Field(default=None, max_length=40)
+    opt_out: bool | None = None
+    bloqueado: bool | None = None
+    proxima_acao_em: datetime | None = None
+    dados_adicionais: dict[str, Any] | None = None
+
+    @field_validator("cpf_cnpj")
+    @classmethod
+    def validar_documento(cls, valor: str | None) -> str | None:
+        return normalizar_documento(valor)
+
+    @field_validator("uf")
+    @classmethod
+    def validar_uf(cls, valor: str | None) -> str | None:
+        return valor.upper() if valor else None
+
+    @field_validator("vendedor_codigo")
+    @classmethod
+    def validar_codigo_vendedor(cls, valor: str | None) -> str | None:
+        return valor.upper() if valor else None
+
+
+class AgendaCriar(BaseModel):
+    cliente_id: UUID
+    vendedor_codigo: str = Field(max_length=40)
+    data_agenda: date
+    horario_previsto: time | None = None
+    prioridade: int = Field(default=3, ge=1, le=5)
+    objetivo: str | None = Field(default=None, max_length=255)
+    canal_preferencial: Literal["telefone", "whatsapp", "email"] = "telefone"
+    maximo_tentativas: int = Field(default=3, ge=1, le=10)
+    observacao: str | None = None
+
+    @field_validator("vendedor_codigo")
+    @classmethod
+    def validar_codigo_vendedor(cls, valor: str) -> str:
+        return valor.upper()
+
+
+class AgendaAtualizar(BaseModel):
+    data_agenda: date | None = None
+    horario_previsto: time | None = None
+    prioridade: int | None = Field(default=None, ge=1, le=5)
+    objetivo: str | None = Field(default=None, max_length=255)
+    canal_preferencial: Literal["telefone", "whatsapp", "email"] | None = None
+    status: Literal[
+        "pendente",
+        "em_execucao",
+        "concluida",
+        "reagendada",
+        "cancelada",
+        "sem_resposta",
+    ] | None = None
+    numero_tentativas: int | None = Field(default=None, ge=0, le=100)
+    maximo_tentativas: int | None = Field(default=None, ge=1, le=10)
+    ultima_tentativa_em: datetime | None = None
+    proxima_tentativa_em: datetime | None = None
+    resultado: str | None = Field(default=None, max_length=80)
+    observacao: str | None = None
+
+
+class AssumirProximaAgenda(BaseModel):
+    vendedor_codigo: str = Field(max_length=40)
+    data_agenda: date | None = None
+
+    @field_validator("vendedor_codigo")
+    @classmethod
+    def validar_codigo_vendedor(cls, valor: str) -> str:
+        return valor.upper()
+
+
+class ChamadaIniciar(BaseModel):
+    agenda_id: UUID
+    provedor: str = Field(max_length=60)
+    chamada_externa_id: str | None = Field(default=None, max_length=150)
+    numero_origem: str | None = Field(default=None, max_length=30)
+    numero_destino: str | None = Field(default=None, max_length=30)
+    status: Literal["iniciada", "em_andamento"] = "iniciada"
+
+
+class ChamadaFinalizar(BaseModel):
+    status: Literal[
+        "concluida",
+        "nao_atendida",
+        "ocupado",
+        "falha",
+        "cancelada",
+    ]
+    atendida: bool = False
+    fim_em: datetime | None = None
+    duracao_segundos: int | None = Field(default=None, ge=0)
+    gravacao_url: str | None = None
+    transcricao: str | None = None
+    resumo: str | None = None
+    sentimento: str | None = Field(default=None, max_length=40)
+    intencao: str | None = Field(default=None, max_length=80)
+    resultado: str | None = Field(default=None, max_length=80)
+    custo_telefonia: float = Field(default=0, ge=0)
+    custo_ia: float = Field(default=0, ge=0)
+    dados_extraidos: dict[str, Any] = Field(default_factory=dict)
+    agenda_status: Literal[
+        "concluida",
+        "reagendada",
+        "cancelada",
+        "sem_resposta",
+    ]
+    proxima_tentativa_em: datetime | None = None
+    observacao_agenda: str | None = None
+    cliente_status: str | None = Field(default=None, max_length=40)
+    proxima_acao_em: datetime | None = None
+
+    @model_validator(mode="after")
+    def validar_reagendamento(self):
+        if self.agenda_status == "reagendada" and self.proxima_tentativa_em is None:
+            raise ValueError(
+                "Informe proxima_tentativa_em quando a agenda for reagendada."
+            )
+        return self
+
+
+class TurnoConversaVoz(BaseModel):
+    numero: int = Field(ge=1, le=100)
+    cliente: str = Field(min_length=1, max_length=5000)
+    agente: str | None = Field(default=None, max_length=5000)
+
+
+class ConversaVozRegistrar(BaseModel):
+    cliente_id: UUID
+    vendedor_codigo: str = Field(max_length=40)
+    agenda_id: UUID | None = None
+    provedor: str = Field(
+        default="asterisk_audiosocket",
+        max_length=60,
+    )
+    chamada_externa_id: str = Field(min_length=8, max_length=150)
+    numero_origem: str | None = Field(default=None, max_length=30)
+    numero_destino: str | None = Field(default=None, max_length=30)
+    direcao: Literal["entrada", "saida"] = "saida"
+    inicio_em: datetime
+    fim_em: datetime
+    duracao_segundos: int = Field(ge=0)
+    resumo: str | None = Field(default=None, max_length=4000)
+    sentimento: str | None = Field(default=None, max_length=40)
+    intencao: str = Field(
+        default="consulta_peca",
+        max_length=80,
+    )
+    resultado: str = Field(max_length=80)
+    levantamento_completo: bool = False
+    motivo_encerramento: str | None = Field(
+        default=None,
+        max_length=200,
+    )
+    estado_comercial: dict[str, Any] = Field(default_factory=dict)
+    turnos: list[TurnoConversaVoz] = Field(
+        default_factory=list,
+        max_length=20,
+    )
+    modelos: dict[str, Any] = Field(default_factory=dict)
+    dados_extraidos: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("vendedor_codigo")
+    @classmethod
+    def validar_codigo_vendedor(cls, valor: str) -> str:
+        return valor.upper()
+
+    @model_validator(mode="after")
+    def validar_periodo(self):
+        if self.fim_em < self.inicio_em:
+            raise ValueError(
+                "fim_em não pode ser anterior a inicio_em."
+            )
+        return self
+
+
+class PendenciaComercialAtualizar(BaseModel):
+    status: Literal[
+        "pendente",
+        "em_analise",
+        "aguardando_reposicao",
+        "aguardando_catalogo",
+        "resolvida",
+        "cancelada",
+    ] | None = None
+    responsavel: str | None = Field(
+        default=None,
+        max_length=150,
+    )
+    previsao_retorno: datetime | None = None
+    resolucao: str | None = Field(
+        default=None,
+        max_length=4000,
+    )
+
+
+
+class TwilioTesteChamada(BaseModel):
+    numero_destino: str = Field(
+        description="Número verificado na Twilio, no padrão E.164.",
+        examples=["+5541999999999"],
+    )
+    timeout_segundos: int = Field(default=25, ge=10, le=60)
+
+    @field_validator("numero_destino")
+    @classmethod
+    def validar_destino(cls, valor: str) -> str:
+        return validar_numero_e164(valor)
+
+
+class TwilioTesteInterativo(BaseModel):
+    numero_destino: str = Field(
+        description="Número verificado na Twilio, no padrão E.164.",
+        examples=["+5541999999999"],
+    )
+    timeout_segundos: int = Field(default=25, ge=10, le=60)
+
+    @field_validator("numero_destino")
+    @classmethod
+    def validar_destino(cls, valor: str) -> str:
+        return validar_numero_e164(valor)
+
+
+def buscar_produto_catalogo_exato(
+    cursor,
+    codigo: str,
+) -> dict[str, Any] | None:
+    codigo_limpo = codigo.strip()
+
+    cursor.execute(
+        """
+        SELECT
+            id_olist AS id,
+            sku,
+            descricao,
+            unidade,
+            gtin,
+            preco,
+            preco_promocional,
+            preco_efetivo,
+            preco_disponivel,
+            localizacao,
+            ativo,
+            sincronizado_em
+        FROM comercial.olist_catalogo_produtos
+        WHERE sku = %s
+           OR id_olist::text = %s
+        ORDER BY ativo DESC
+        LIMIT 1;
+        """,
+        (codigo_limpo, codigo_limpo),
+    )
+    return cursor.fetchone()
+
+
+def obter_configuracao_encarte(
+    cursor,
+) -> dict[str, Any]:
+    cursor.execute(
+        """
+        SELECT
+            id,
+            titulo,
+            inicio_vigencia,
+            fim_vigencia,
+            ativo,
+            atualizado_em
+        FROM comercial.encarte_configuracao
+        WHERE id = 1;
+        """
+    )
+    configuracao = cursor.fetchone()
+
+    if configuracao is None:
+        hoje = datetime.now(FUSO_PROJETO).date()
+        inicio = hoje.replace(day=1)
+        if inicio.month == 12:
+            proximo_mes = inicio.replace(
+                year=inicio.year + 1,
+                month=1,
+            )
+        else:
+            proximo_mes = inicio.replace(
+                month=inicio.month + 1,
+            )
+        fim = proximo_mes - timedelta(days=1)
+
+        cursor.execute(
+            """
+            INSERT INTO comercial.encarte_configuracao (
+                id,
+                titulo,
+                inicio_vigencia,
+                fim_vigencia,
+                ativo
+            )
+            VALUES (
+                1,
+                %s,
+                %s,
+                %s,
+                TRUE
+            )
+            RETURNING
+                id,
+                titulo,
+                inicio_vigencia,
+                fim_vigencia,
+                ativo,
+                atualizado_em;
+            """,
+            (
+                f"Encarte {inicio.strftime('%m/%Y')}",
+                inicio,
+                fim,
+            ),
+        )
+        configuracao = cursor.fetchone()
+
+    return configuracao
+
+
+def obter_item_encarte_detalhado(
+    cursor,
+    item_id: UUID,
+) -> dict[str, Any]:
+    cursor.execute(
+        """
+        SELECT
+            ep.id,
+            ep.sku,
+            ep.produto_id_olist,
+            ep.descricao_snapshot,
+            ep.prioridade,
+            ep.ativo,
+            ep.observacao,
+            ep.criado_em,
+            ep.atualizado_em,
+            cp.descricao AS descricao_catalogo,
+            cp.preco AS preco_normal,
+            cp.preco_promocional,
+            cp.preco_efetivo AS preco_catalogo,
+            cp.preco_disponivel,
+            cp.ativo AS produto_ativo,
+            cp.sincronizado_em
+        FROM comercial.encarte_produtos ep
+        LEFT JOIN comercial.olist_catalogo_produtos cp
+            ON cp.sku = ep.sku
+        WHERE ep.id = %s;
+        """,
+        (item_id,),
+    )
+    item = cursor.fetchone()
+
+    if item is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Produto do encarte não encontrado.",
+        )
+
+    return item
+
+
+def formatar_produto_encarte(
+    produto: dict[str, Any],
+) -> dict[str, Any]:
+    preco_promocional = normalizar_preco(
+        produto.get("preco_promocional")
+    )
+    preco_catalogo = normalizar_preco(
+        produto.get("preco_efetivo")
+    )
+    preco_normal = normalizar_preco(
+        produto.get("preco")
+    )
+    preco_oferta = (
+        preco_promocional
+        or preco_catalogo
+        or preco_normal
+    )
+
+    return {
+        **produto,
+        "preco": preco_normal,
+        "preco_promocional": preco_promocional,
+        "preco_catalogo": preco_catalogo,
+        "preco_oferta": preco_oferta,
+        "origem_preco": "olist",
+        "preco_editavel": False,
+    }
+
+
+
+def normalizar_nome_olist(
+    valor: str | None,
+) -> str:
+    return normalizar_texto_busca(valor).strip()
+
+
+def normalizar_item_vendedor_olist(
+    item: dict[str, Any],
+) -> dict[str, Any]:
+    contato = item.get("contato")
+    if not isinstance(contato, dict):
+        contato = {}
+
+    return {
+        "id": item.get("id"),
+        "nome": contato.get("nome"),
+        "fantasia": contato.get("fantasia"),
+        "codigo": contato.get("codigo"),
+        "cpf_cnpj": contato.get("cpfCnpj"),
+        "email": contato.get("email"),
+        "contato_id": contato.get("id"),
+        "contato": contato,
+    }
+
+
+def listar_vendedores_olist_completo(
+    nome: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    vendedores: list[dict[str, Any]] = []
+    offset = 0
+    limite = 100
+    limites_olist: dict[str, str] = {}
+
+    while True:
+        parametros: dict[str, Any] = {
+            "limit": limite,
+            "offset": offset,
+        }
+        if nome:
+            parametros["nome"] = nome
+
+        retorno, limites_olist = requisicao_get_olist(
+            "vendedores",
+            parametros,
+        )
+
+        itens = (
+            retorno.get("itens")
+            if isinstance(retorno, dict)
+            else []
+        )
+        if not isinstance(itens, list):
+            itens = []
+
+        vendedores.extend(
+            normalizar_item_vendedor_olist(item)
+            for item in itens
+            if isinstance(item, dict)
+        )
+
+        paginacao = (
+            retorno.get("paginacao")
+            if isinstance(retorno, dict)
+            else {}
+        )
+        if not isinstance(paginacao, dict):
+            paginacao = {}
+
+        total = int(
+            paginacao.get("total")
+            or len(vendedores)
+        )
+        offset += len(itens)
+
+        if not itens or offset >= total:
+            break
+
+    return vendedores, limites_olist
+
+
+def pontuar_vendedor_olist(
+    vendedor: dict[str, Any],
+    nome_alvo: str,
+    codigo_alvo: str,
+) -> int:
+    nome = normalizar_nome_olist(
+        vendedor.get("nome")
+    )
+    fantasia = normalizar_nome_olist(
+        vendedor.get("fantasia")
+    )
+    codigo = normalizar_nome_olist(
+        vendedor.get("codigo")
+    )
+
+    if codigo_alvo and codigo == codigo_alvo:
+        return 1000
+
+    if nome == nome_alvo or fantasia == nome_alvo:
+        return 900
+
+    nome_tokens = set(nome.split())
+    fantasia_tokens = set(fantasia.split())
+
+    if (
+        nome_alvo in nome_tokens
+        or nome_alvo in fantasia_tokens
+    ):
+        return 800
+
+    if (
+        nome.startswith(nome_alvo + " ")
+        or fantasia.startswith(nome_alvo + " ")
+    ):
+        return 750
+
+    if (
+        nome_alvo
+        and (
+            nome_alvo in nome
+            or nome_alvo in fantasia
+        )
+    ):
+        return 600
+
+    return 0
+
+
+def resolver_vendedor_padrao_olist() -> dict[str, Any]:
+    nome_alvo = normalizar_nome_olist(
+        OLIST_VENDEDOR_PADRAO_NOME
+    )
+    codigo_alvo = normalizar_nome_olist(
+        OLIST_VENDEDOR_PADRAO_CODIGO
+    )
+
+    # Caminho mais seguro: ID configurado manualmente.
+    if OLIST_VENDEDOR_PADRAO_ID:
+        if not OLIST_VENDEDOR_PADRAO_ID.isdigit():
+            return {
+                "status": "configuracao_invalida",
+                "detalhe": (
+                    "OLIST_VENDEDOR_PADRAO_ID deve conter "
+                    "somente números."
+                ),
+            }
+
+        vendedores, limites = (
+            listar_vendedores_olist_completo()
+        )
+        id_alvo = int(OLIST_VENDEDOR_PADRAO_ID)
+
+        encontrados = [
+            vendedor
+            for vendedor in vendedores
+            if vendedor.get("id") == id_alvo
+        ]
+
+        if len(encontrados) == 1:
+            vendedor = encontrados[0]
+            return {
+                "status": "localizado",
+                "id": id_alvo,
+                "nome": (
+                    vendedor.get("nome")
+                    or vendedor.get("fantasia")
+                    or OLIST_VENDEDOR_PADRAO_NOME
+                ),
+                "codigo": vendedor.get("codigo"),
+                "criterio": "id_configurado",
+                "vendedor": vendedor,
+                "rate_limit": limites,
+            }
+
+        return {
+            "status": "nao_localizado",
+            "detalhe": (
+                "O ID configurado em "
+                "OLIST_VENDEDOR_PADRAO_ID não foi encontrado."
+            ),
+            "id_configurado": id_alvo,
+            "rate_limit": limites,
+        }
+
+    # Primeiro tenta o filtro parcial documentado pela Olist.
+    vendedores, limites = listar_vendedores_olist_completo(
+        OLIST_VENDEDOR_PADRAO_NOME
+    )
+
+    # Caso o filtro não retorne nada, carrega a lista completa para
+    # permitir correspondência também pelo código.
+    if not vendedores:
+        vendedores, limites = (
+            listar_vendedores_olist_completo()
+        )
+
+    candidatos: list[dict[str, Any]] = []
+
+    for vendedor in vendedores:
+        pontuacao = pontuar_vendedor_olist(
+            vendedor,
+            nome_alvo,
+            codigo_alvo,
+        )
+        if pontuacao <= 0:
+            continue
+
+        candidatos.append(
+            {
+                **vendedor,
+                "pontuacao": pontuacao,
+            }
+        )
+
+    candidatos.sort(
+        key=lambda item: (
+            item["pontuacao"],
+            int(item.get("id") or 0),
+        ),
+        reverse=True,
+    )
+
+    if candidatos:
+        melhor_pontuacao = candidatos[0]["pontuacao"]
+        melhores = [
+            candidato
+            for candidato in candidatos
+            if candidato["pontuacao"]
+            == melhor_pontuacao
+        ]
+
+        if len(melhores) == 1 and melhores[0].get("id"):
+            vendedor = melhores[0]
+            return {
+                "status": "localizado",
+                "id": int(vendedor["id"]),
+                "nome": (
+                    vendedor.get("nome")
+                    or vendedor.get("fantasia")
+                    or OLIST_VENDEDOR_PADRAO_NOME
+                ),
+                "codigo": vendedor.get("codigo"),
+                "criterio": (
+                    "codigo_exato"
+                    if melhor_pontuacao == 1000
+                    else (
+                        "nome_exato"
+                        if melhor_pontuacao == 900
+                        else "nome_compativel"
+                    )
+                ),
+                "vendedor": vendedor,
+                "rate_limit": limites,
+            }
+
+        return {
+            "status": "duplicado",
+            "detalhe": (
+                "Mais de um vendedor corresponde ao padrão "
+                f"{OLIST_VENDEDOR_PADRAO_NOME}. "
+                "Configure OLIST_VENDEDOR_PADRAO_ID."
+            ),
+            "resultados": melhores,
+            "rate_limit": limites,
+        }
+
+    return {
+        "status": "nao_localizado",
+        "detalhe": (
+            "Nenhum vendedor correspondeu ao nome ou código "
+            f"{OLIST_VENDEDOR_PADRAO_NOME}."
+        ),
+        "configuracao": {
+            "nome": OLIST_VENDEDOR_PADRAO_NOME,
+            "codigo": OLIST_VENDEDOR_PADRAO_CODIGO,
+            "id": OLIST_VENDEDOR_PADRAO_ID or None,
+        },
+        "vendedores_retornados": vendedores[:100],
+        "rate_limit": limites,
+    }
+
+
+def buscar_cliente_olist_por_documento(
+    documento: str,
+) -> dict[str, Any]:
+    documento_normalizado = normalizar_documento(
+        documento
+    )
+
+    if len(documento_normalizado) not in {11, 14}:
+        return {
+            "status": "documento_invalido",
+            "detalhe": (
+                "O CPF/CNPJ precisa ter 11 ou 14 dígitos."
+            ),
+        }
+
+    retorno, limites = requisicao_get_olist(
+        "contatos",
+        {
+            "cpfCnpj": documento_normalizado,
+            "situacao": "B",
+            "limit": 100,
+        },
+    )
+
+    itens = (
+        retorno.get("itens")
+        if isinstance(retorno, dict)
+        else []
+    )
+    if not isinstance(itens, list):
+        itens = []
+
+    exatos = [
+        item
+        for item in itens
+        if isinstance(item, dict)
+        and normalizar_documento(
+            item.get("cpfCnpj")
+        )
+        == documento_normalizado
+    ]
+
+    if len(exatos) == 1 and exatos[0].get("id"):
+        return {
+            "status": "localizado",
+            "id": int(exatos[0]["id"]),
+            "documento": documento_normalizado,
+            "contato": exatos[0],
+            "rate_limit": limites,
+        }
+
+    if len(exatos) > 1:
+        return {
+            "status": "duplicado",
+            "documento": documento_normalizado,
+            "detalhe": (
+                "Há mais de um contato ativo com o mesmo "
+                "CPF/CNPJ na Olist."
+            ),
+            "resultados": exatos,
+            "rate_limit": limites,
+        }
+
+    return {
+        "status": "nao_localizado",
+        "documento": documento_normalizado,
+        "detalhe": (
+            "Cliente não localizado na Olist pelo CPF/CNPJ."
+        ),
+        "rate_limit": limites,
+    }
+
+
+def preparar_proposta_comercial(
+    orcamento_id: UUID,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            orcamento = obter_orcamento_ia_detalhado(
+                cursor,
+                orcamento_id,
+            )
+
+    numero_proposta = (
+        orcamento.get("numero_proposta")
+        or (
+            "RBK-IA-"
+            + str(orcamento_id).split("-")[0].upper()
+        )
+    )
+
+    documento = normalizar_documento(
+        orcamento.get("cpf_cnpj")
+    )
+
+    vendedor = resolver_vendedor_padrao_olist()
+
+    if len(documento) not in {11, 14}:
+        cliente = {
+            "status": "documento_invalido",
+            "documento": documento or None,
+            "detalhe": (
+                "O cliente não possui CPF/CNPJ válido "
+                "para pesquisa na Olist."
+            ),
+        }
+    else:
+        cliente = buscar_cliente_olist_por_documento(
+            documento
+        )
+
+    if vendedor.get("status") != "localizado":
+        proposta_status = "vendedor_pendente"
+    elif cliente.get("status") == "documento_invalido":
+        proposta_status = "aguardando_documento_cliente"
+    elif cliente.get("status") == "duplicado":
+        proposta_status = "cliente_duplicado_olist"
+    elif cliente.get("status") != "localizado":
+        proposta_status = "cliente_nao_localizado_olist"
+    else:
+        proposta_status = "aguardando_revisao"
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT oportunidade_id
+                FROM comercial.orcamentos_ia
+                WHERE id = %s
+                FOR UPDATE;
+                """,
+                (orcamento_id,),
+            )
+            registro = cursor.fetchone()
+            oportunidade_id = (
+                registro.get("oportunidade_id")
+                if registro
+                else None
+            )
+
+            if oportunidade_id is None:
+                cursor.execute(
+                    """
+                    INSERT INTO comercial.oportunidades (
+                        cliente_id,
+                        vendedor_id,
+                        origem,
+                        etapa,
+                        titulo,
+                        descricao,
+                        valor_estimado,
+                        probabilidade,
+                        produtos,
+                        proxima_acao,
+                        proxima_acao_em
+                    )
+                    VALUES (
+                        %s,
+                        %s,
+                        'agente_voz',
+                        'proposta_comercial',
+                        %s,
+                        %s,
+                        %s,
+                        60,
+                        %s,
+                        'Revisar proposta comercial',
+                        NOW() + INTERVAL '1 day'
+                    )
+                    RETURNING id;
+                    """,
+                    (
+                        orcamento["cliente_id"],
+                        orcamento["vendedor_id"],
+                        f"Proposta comercial {numero_proposta}",
+                        (
+                            "Proposta comercial criada pelo "
+                            "RBK Vendedor IA e aguardando revisão."
+                        ),
+                        orcamento["valor_total"],
+                        Jsonb(orcamento["itens"]),
+                    ),
+                )
+                oportunidade_id = cursor.fetchone()["id"]
+
+            cursor.execute(
+                """
+                UPDATE comercial.orcamentos_ia
+                SET
+                    status = 'aguardando_revisao',
+                    numero_proposta = %s,
+                    proposta_status = %s,
+                    proposta_criada_em = COALESCE(
+                        proposta_criada_em,
+                        NOW()
+                    ),
+                    documento_consulta = %s,
+                    olist_contato_id = %s,
+                    olist_vendedor_id = %s,
+                    olist_vendedor_nome = %s,
+                    cliente_localizado_olist = %s,
+                    oportunidade_id = %s,
+                    atualizado_em = NOW()
+                WHERE id = %s;
+                """,
+                (
+                    numero_proposta,
+                    proposta_status,
+                    documento or None,
+                    (
+                        cliente.get("id")
+                        if cliente.get("status")
+                        == "localizado"
+                        else None
+                    ),
+                    (
+                        vendedor.get("id")
+                        if vendedor.get("status")
+                        == "localizado"
+                        else None
+                    ),
+                    (
+                        vendedor.get("nome")
+                        if vendedor.get("status")
+                        == "localizado"
+                        else OLIST_VENDEDOR_PADRAO_NOME
+                    ),
+                    cliente.get("status") == "localizado",
+                    oportunidade_id,
+                    orcamento_id,
+                ),
+            )
+
+            if cliente.get("status") == "localizado":
+                cursor.execute(
+                    """
+                    UPDATE comercial.clientes
+                    SET
+                        olist_id = %s,
+                        atualizado_em = NOW()
+                    WHERE id = %s;
+                    """,
+                    (
+                        str(cliente["id"]),
+                        orcamento["cliente_id"],
+                    ),
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.interacoes (
+                    cliente_id,
+                    vendedor_id,
+                    canal,
+                    direcao,
+                    tipo,
+                    resumo,
+                    intencao,
+                    mensagem_externa_id
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'sistema',
+                    'saida',
+                    'proposta_comercial_criada',
+                    %s,
+                    'proposta_comercial',
+                    %s
+                );
+                """,
+                (
+                    orcamento["cliente_id"],
+                    orcamento["vendedor_id"],
+                    (
+                        f"Proposta {numero_proposta} criada "
+                        f"com status {proposta_status}. "
+                        f"Vendedor Olist: "
+                        f"{OLIST_VENDEDOR_PADRAO_NOME}."
+                    ),
+                    f"proposta-{orcamento_id}",
+                ),
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    vendedor_id,
+                    cliente_id,
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'criar_proposta_comercial',
+                    'orcamento_ia_confirmado',
+                    %s,
+                    %s,
+                    TRUE
+                );
+                """,
+                (
+                    orcamento["vendedor_id"],
+                    orcamento["cliente_id"],
+                    Jsonb(
+                        {
+                            "orcamento_id": str(orcamento_id),
+                            "documento": documento or None,
+                        }
+                    ),
+                    Jsonb(
+                        {
+                            "numero_proposta": numero_proposta,
+                            "proposta_status": proposta_status,
+                            "cliente_olist": cliente,
+                            "vendedor_olist": vendedor,
+                        }
+                    ),
+                ),
+            )
+
+            detalhado = obter_orcamento_ia_detalhado(
+                cursor,
+                orcamento_id,
+            )
+        conexao.commit()
+
+    return {
+        "status": proposta_status,
+        "numero_proposta": numero_proposta,
+        "cliente_olist": cliente,
+        "vendedor_olist": vendedor,
+        "proposta": detalhado,
+    }
+
+
+def obter_orcamento_ia_detalhado(
+    cursor,
+    orcamento_id: UUID,
+) -> dict[str, Any]:
+    cursor.execute(
+        """
+        SELECT
+            o.id,
+            o.chamada_externa_id,
+            o.status,
+            o.quantidade_linhas,
+            o.quantidade_unidades,
+            o.valor_total,
+            o.origem,
+            o.confirmado_em,
+            o.numero_proposta,
+            o.proposta_status,
+            o.proposta_criada_em,
+            o.documento_consulta,
+            o.olist_contato_id,
+            o.olist_vendedor_id,
+            o.olist_vendedor_nome,
+            o.cliente_localizado_olist,
+            o.observacao_revisao,
+            o.revisado_em,
+            o.oportunidade_id,
+            o.criado_em,
+            o.atualizado_em,
+            c.id AS cliente_id,
+            c.olist_id AS cliente_olist_id,
+            c.tipo_pessoa,
+            c.cpf_cnpj,
+            c.razao_social,
+            c.nome_fantasia,
+            c.nome_contato,
+            c.telefone,
+            c.whatsapp,
+            c.email,
+            c.cidade,
+            c.uf,
+            c.dados_adicionais AS cliente_dados_adicionais,
+            v.id AS vendedor_id,
+            v.codigo AS vendedor_codigo,
+            v.nome_exibicao AS vendedor_nome
+        FROM comercial.orcamentos_ia o
+        JOIN comercial.clientes c
+            ON c.id = o.cliente_id
+        JOIN comercial.vendedores_ia v
+            ON v.id = o.vendedor_id
+        WHERE o.id = %s;
+        """,
+        (orcamento_id,),
+    )
+    orcamento = cursor.fetchone()
+
+    if orcamento is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Orçamento IA não encontrado.",
+        )
+
+    cursor.execute(
+        """
+        SELECT
+            id,
+            sku,
+            produto_id_olist,
+            descricao,
+            quantidade,
+            valor_unitario,
+            valor_total,
+            origem,
+            disponibilidade,
+            dados_adicionais,
+            criado_em,
+            atualizado_em
+        FROM comercial.orcamento_itens_ia
+        WHERE orcamento_id = %s
+        ORDER BY criado_em, descricao;
+        """,
+        (orcamento_id,),
+    )
+    itens = cursor.fetchall()
+
+    return {
+        **orcamento,
+        "itens": itens,
+    }
+
+
+def recalcular_orcamento_ia(
+    cursor,
+    orcamento_id: UUID,
+) -> None:
+    cursor.execute(
+        """
+        UPDATE comercial.orcamentos_ia o
+        SET
+            quantidade_linhas = resumo.quantidade_linhas,
+            quantidade_unidades = resumo.quantidade_unidades,
+            valor_total = resumo.valor_total,
+            atualizado_em = NOW()
+        FROM (
+            SELECT
+                COUNT(*)::INTEGER AS quantidade_linhas,
+                COALESCE(SUM(quantidade), 0) AS quantidade_unidades,
+                COALESCE(SUM(valor_total), 0) AS valor_total
+            FROM comercial.orcamento_itens_ia
+            WHERE orcamento_id = %s
+        ) resumo
+        WHERE o.id = %s;
+        """,
+        (orcamento_id, orcamento_id),
+    )
+
+
+def obter_ou_criar_orcamento_ia(
+    cursor,
+    chamada_externa_id: str,
+    cliente_id: UUID,
+    vendedor_id: UUID,
+) -> dict[str, Any]:
+    cursor.execute(
+        """
+        INSERT INTO comercial.orcamentos_ia (
+            chamada_externa_id,
+            cliente_id,
+            vendedor_id,
+            status,
+            origem
+        )
+        VALUES (
+            %s,
+            %s,
+            %s,
+            'rascunho',
+            'agente_voz'
+        )
+        ON CONFLICT (chamada_externa_id) DO NOTHING
+        RETURNING id, cliente_id, vendedor_id, status;
+        """,
+        (
+            chamada_externa_id,
+            cliente_id,
+            vendedor_id,
+        ),
+    )
+    orcamento = cursor.fetchone()
+
+    if orcamento is None:
+        cursor.execute(
+            """
+            SELECT id, cliente_id, vendedor_id, status
+            FROM comercial.orcamentos_ia
+            WHERE chamada_externa_id = %s;
+            """,
+            (chamada_externa_id,),
+        )
+        orcamento = cursor.fetchone()
+
+    if orcamento is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Não foi possível obter o orçamento IA.",
+        )
+
+    if (
+        orcamento["cliente_id"] != cliente_id
+        or orcamento["vendedor_id"] != vendedor_id
+    ):
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail=(
+                "A chamada já está vinculada a outro cliente "
+                "ou vendedor."
+            ),
+        )
+
+    if orcamento["status"] in {
+        "confirmado",
+        "enviado_olist",
+        "cancelado",
+    }:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail=(
+                "O orçamento não aceita novos itens no status "
+                f"{orcamento['status']}."
+            ),
+        )
+
+    return orcamento
+
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not DATABASE_URL:
+        raise RuntimeError("A variável DATABASE_URL não foi configurada.")
+
+    if not API_KEY:
+        raise RuntimeError("A variável API_KEY não foi configurada.")
+
+    variaveis_twilio = {
+        "TWILIO_ACCOUNT_SID": TWILIO_ACCOUNT_SID,
+        "TWILIO_AUTH_TOKEN": TWILIO_AUTH_TOKEN,
+        "TWILIO_PHONE_NUMBER": TWILIO_PHONE_NUMBER,
+        "TWILIO_BASE_URL": TWILIO_BASE_URL,
+    }
+    ausentes = [
+        nome
+        for nome, valor in variaveis_twilio.items()
+        if not valor
+    ]
+
+    if ausentes:
+        raise RuntimeError(
+            "Variáveis Twilio não configuradas: " + ", ".join(ausentes)
+        )
+
+    if not TWILIO_ACCOUNT_SID.startswith("AC"):
+        raise RuntimeError("TWILIO_ACCOUNT_SID inválido.")
+
+    try:
+        validar_numero_e164(TWILIO_PHONE_NUMBER)
+    except ValueError as erro:
+        raise RuntimeError("TWILIO_PHONE_NUMBER inválido.") from erro
+
+    if not TWILIO_BASE_URL.startswith("https://"):
+        raise RuntimeError("TWILIO_BASE_URL deve usar HTTPS.")
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    current_database() AS banco,
+                    to_regclass('comercial.vendedores_ia') AS tabela_vendedores,
+                    to_regclass('comercial.clientes') AS tabela_clientes,
+                    to_regclass('comercial.agendas_comerciais') AS tabela_agendas,
+                    to_regclass('comercial.chamadas_ia') AS tabela_chamadas,
+                    to_regclass('comercial.interacoes') AS tabela_interacoes,
+                    to_regclass('comercial.acoes_agente') AS tabela_acoes,
+                    to_regclass('comercial.configuracoes') AS tabela_configuracoes,
+                    to_regclass('comercial.olist_oauth_tokens') AS tabela_olist_tokens,
+                    to_regclass('comercial.olist_oauth_states') AS tabela_olist_states,
+                    to_regclass('comercial.consultas_olist') AS tabela_consultas_olist,
+                    to_regclass('comercial.olist_catalogo_produtos') AS tabela_catalogo_olist,
+                    to_regclass('comercial.olist_catalogo_sincronizacoes') AS tabela_catalogo_sync,
+                    to_regclass('comercial.pendencias_comerciais') AS tabela_pendencias_comerciais,
+                    to_regclass('comercial.encarte_configuracao') AS tabela_encarte_configuracao,
+                    to_regclass('comercial.encarte_produtos') AS tabela_encarte_produtos,
+                    to_regclass('comercial.orcamentos_ia') AS tabela_orcamentos_ia,
+                    to_regclass('comercial.orcamento_itens_ia') AS tabela_orcamento_itens_ia;
+                """
+            )
+            resultado = cursor.fetchone()
+
+            if resultado is None:
+                raise RuntimeError(
+                    "Não foi possível validar a estrutura do banco de dados."
+                )
+
+            tabelas = [
+                resultado["tabela_vendedores"],
+                resultado["tabela_clientes"],
+                resultado["tabela_agendas"],
+                resultado["tabela_chamadas"],
+                resultado["tabela_interacoes"],
+                resultado["tabela_acoes"],
+                resultado["tabela_configuracoes"],
+                resultado["tabela_olist_tokens"],
+                resultado["tabela_olist_states"],
+                resultado["tabela_consultas_olist"],
+                resultado["tabela_catalogo_olist"],
+                resultado["tabela_catalogo_sync"],
+                resultado["tabela_pendencias_comerciais"],
+                resultado["tabela_encarte_configuracao"],
+                resultado["tabela_encarte_produtos"],
+                resultado["tabela_orcamentos_ia"],
+                resultado["tabela_orcamento_itens_ia"],
+            ]
+
+            if any(tabela is None for tabela in tabelas):
+                raise RuntimeError(
+                    f"Estrutura comercial incompleta no banco {resultado['banco']}."
+                )
+
+    yield
+
+
+app = FastAPI(
+    title="RBK Vendedor IA API",
+    description="API comercial do projeto piloto RBK Vendedor IA.",
+    version="0.12.3",
+    lifespan=lifespan,
+)
+
+
+@app.get("/saude", tags=["Sistema"])
+def saude() -> dict[str, str]:
+    return {
+        "status": "ok",
+        "servico": "api-comercial",
+        "projeto": "RBK Vendedor IA",
+        "versao": "0.12.3",
+    }
+
+
+@app.get(
+    "/encarte-admin",
+    tags=["Encarte"],
+    include_in_schema=False,
+)
+def tela_administracao_encarte() -> Response:
+    if not ENCARTE_ADMIN_HTML.is_file():
+        return Response(
+            content=(
+                "<h1>Tela do encarte não encontrada</h1>"
+                "<p>O arquivo encarte_admin.html não foi incluído.</p>"
+            ),
+            status_code=500,
+            media_type="text/html",
+        )
+
+    return Response(
+        content=ENCARTE_ADMIN_HTML.read_text(
+            encoding="utf-8"
+        ),
+        media_type="text/html",
+    )
+
+
+@app.get(
+    "/encarte/configuracao",
+    tags=["Encarte"],
+    dependencies=[Depends(validar_api_key)],
+)
+def consultar_configuracao_encarte() -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            configuracao = obter_configuracao_encarte(
+                cursor
+            )
+        conexao.commit()
+
+    hoje = datetime.now(FUSO_PROJETO).date()
+    vigente = bool(
+        configuracao["ativo"]
+        and configuracao["inicio_vigencia"]
+        <= hoje
+        <= configuracao["fim_vigencia"]
+    )
+
+    return {
+        **configuracao,
+        "vigente": vigente,
+        "data_referencia": hoje,
+    }
+
+
+@app.put(
+    "/encarte/configuracao",
+    tags=["Encarte"],
+    dependencies=[Depends(validar_api_key)],
+)
+def atualizar_configuracao_encarte(
+    dados: EncarteConfiguracaoAtualizar,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO comercial.encarte_configuracao (
+                    id,
+                    titulo,
+                    inicio_vigencia,
+                    fim_vigencia,
+                    ativo,
+                    atualizado_em
+                )
+                VALUES (
+                    1,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    NOW()
+                )
+                ON CONFLICT (id) DO UPDATE
+                SET
+                    titulo = EXCLUDED.titulo,
+                    inicio_vigencia = EXCLUDED.inicio_vigencia,
+                    fim_vigencia = EXCLUDED.fim_vigencia,
+                    ativo = EXCLUDED.ativo,
+                    atualizado_em = NOW()
+                RETURNING
+                    id,
+                    titulo,
+                    inicio_vigencia,
+                    fim_vigencia,
+                    ativo,
+                    atualizado_em;
+                """,
+                (
+                    dados.titulo.strip(),
+                    dados.inicio_vigencia,
+                    dados.fim_vigencia,
+                    dados.ativo,
+                ),
+            )
+            configuracao = cursor.fetchone()
+        conexao.commit()
+
+    return configuracao
+
+
+@app.get(
+    "/encarte/catalogo/{codigo}",
+    tags=["Encarte"],
+    dependencies=[Depends(validar_api_key)],
+)
+def consultar_sku_para_encarte(
+    codigo: str,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            produto = buscar_produto_catalogo_exato(
+                cursor,
+                codigo,
+            )
+
+    if produto is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=(
+                "SKU não localizado no catálogo sincronizado."
+            ),
+        )
+
+    produto_formatado = formatar_produto_encarte(
+        produto
+    )
+
+    try:
+        produto_estoque, rate_limit = (
+            enriquecer_estoque_catalogo(
+                produto_formatado
+            )
+        )
+    except HTTPException:
+        raise
+    except Exception as erro:
+        return {
+            **produto_formatado,
+            "estoque": {
+                "status": "consulta_indisponivel",
+                "disponivel": None,
+            },
+            "aviso": (
+                "O produto foi localizado, mas o estoque "
+                f"não pôde ser consultado: {erro}"
+            ),
+        }
+
+    return {
+        **produto_estoque,
+        "rate_limit": rate_limit,
+    }
+
+
+@app.get(
+    "/encarte/produtos",
+    tags=["Encarte"],
+    dependencies=[Depends(validar_api_key)],
+)
+def listar_produtos_encarte() -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    ep.id,
+                    ep.sku,
+                    ep.produto_id_olist,
+                    ep.descricao_snapshot,
+                            ep.prioridade,
+                    ep.ativo,
+                    ep.observacao,
+                    ep.criado_em,
+                    ep.atualizado_em,
+                    cp.descricao AS descricao_catalogo,
+                    cp.preco AS preco_normal,
+                    cp.preco_promocional,
+                    cp.preco_efetivo AS preco_catalogo,
+                    cp.preco_disponivel,
+                    cp.ativo AS produto_ativo,
+                    cp.sincronizado_em
+                FROM comercial.encarte_produtos ep
+                LEFT JOIN comercial.olist_catalogo_produtos cp
+                    ON cp.sku = ep.sku
+                ORDER BY
+                    ep.ativo DESC,
+                    ep.prioridade ASC,
+                    COALESCE(
+                        cp.descricao,
+                        ep.descricao_snapshot
+                    );
+                """
+            )
+            itens = cursor.fetchall()
+
+    ativos = sum(
+        1
+        for item in itens
+        if item["ativo"]
+    )
+
+    return {
+        "quantidade": len(itens),
+        "ativos": ativos,
+        "itens": itens,
+    }
+
+
+@app.post(
+    "/encarte/produtos",
+    tags=["Encarte"],
+    dependencies=[Depends(validar_api_key)],
+)
+def adicionar_produto_encarte(
+    dados: EncarteProdutoAdicionar,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            produto = buscar_produto_catalogo_exato(
+                cursor,
+                dados.sku,
+            )
+
+            if produto is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail=(
+                        "SKU não localizado no catálogo sincronizado."
+                    ),
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.encarte_produtos (
+                    sku,
+                    produto_id_olist,
+                    descricao_snapshot,
+                    prioridade,
+                    ativo,
+                    observacao
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    TRUE,
+                    %s
+                )
+                ON CONFLICT (sku) DO UPDATE
+                SET
+                    produto_id_olist = EXCLUDED.produto_id_olist,
+                    descricao_snapshot = EXCLUDED.descricao_snapshot,
+                    prioridade = EXCLUDED.prioridade,
+                    ativo = TRUE,
+                    observacao = EXCLUDED.observacao,
+                    atualizado_em = NOW()
+                RETURNING id;
+                """,
+                (
+                    produto["sku"],
+                    produto["id"],
+                    produto["descricao"],
+                    dados.prioridade,
+                    (
+                        dados.observacao.strip()
+                        if dados.observacao
+                        else None
+                    ),
+                ),
+            )
+            item_id = cursor.fetchone()["id"]
+            item = obter_item_encarte_detalhado(
+                cursor,
+                item_id,
+            )
+        conexao.commit()
+
+    return item
+
+
+@app.patch(
+    "/encarte/produtos/{item_id}",
+    tags=["Encarte"],
+    dependencies=[Depends(validar_api_key)],
+)
+def atualizar_produto_encarte(
+    item_id: UUID,
+    dados: EncarteProdutoAtualizar,
+) -> dict[str, Any]:
+    campos: list[str] = []
+    valores: list[Any] = []
+
+    if dados.prioridade is not None:
+        campos.append("prioridade = %s")
+        valores.append(dados.prioridade)
+
+    if dados.ativo is not None:
+        campos.append("ativo = %s")
+        valores.append(dados.ativo)
+
+    if "observacao" in dados.model_fields_set:
+        campos.append("observacao = %s")
+        valores.append(
+            dados.observacao.strip()
+            if dados.observacao
+            else None
+        )
+
+    if not campos:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Nenhuma alteração foi informada.",
+        )
+
+    campos.append("atualizado_em = NOW()")
+    valores.append(item_id)
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                f"""
+                UPDATE comercial.encarte_produtos
+                SET {", ".join(campos)}
+                WHERE id = %s
+                RETURNING id;
+                """,
+                valores,
+            )
+            atualizado = cursor.fetchone()
+
+            if atualizado is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail="Produto do encarte não encontrado.",
+                )
+
+            item = obter_item_encarte_detalhado(
+                cursor,
+                item_id,
+            )
+        conexao.commit()
+
+    return item
+
+
+@app.delete(
+    "/encarte/produtos/{item_id}",
+    tags=["Encarte"],
+    dependencies=[Depends(validar_api_key)],
+)
+def remover_produto_encarte(
+    item_id: UUID,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM comercial.encarte_produtos
+                WHERE id = %s
+                RETURNING
+                    id,
+                    sku,
+                    descricao_snapshot;
+                """,
+                (item_id,),
+            )
+            removido = cursor.fetchone()
+
+            if removido is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail="Produto do encarte não encontrado.",
+                )
+        conexao.commit()
+
+    return {
+        "removido": True,
+        "produto": removido,
+    }
+
+
+@app.get(
+    "/encarte/ofertas",
+    tags=["Encarte"],
+    dependencies=[Depends(validar_api_key)],
+)
+def selecionar_ofertas_encarte(
+    quantidade: int = Query(
+        default=5,
+        ge=3,
+        le=12,
+    ),
+    excluir_skus: str | None = Query(
+        default=None,
+        description=(
+            "SKUs separados por vírgula que já foram "
+            "oferecidos ou adicionados."
+        ),
+    ),
+) -> dict[str, Any]:
+    hoje = datetime.now(FUSO_PROJETO).date()
+    excluidos = {
+        sku.strip()
+        for sku in (excluir_skus or "").split(",")
+        if sku.strip()
+    }
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            configuracao = obter_configuracao_encarte(
+                cursor
+            )
+
+            vigente = bool(
+                configuracao["ativo"]
+                and configuracao["inicio_vigencia"]
+                <= hoje
+                <= configuracao["fim_vigencia"]
+            )
+
+            if not vigente:
+                conexao.commit()
+                return {
+                    "status": "encarte_inativo",
+                    "configuracao": configuracao,
+                    "quantidade_solicitada": quantidade,
+                    "quantidade_retornada": 0,
+                    "ofertas": [],
+                }
+
+            cursor.execute(
+                """
+                SELECT
+                    ep.id AS encarte_item_id,
+                    ep.sku,
+                    ep.produto_id_olist,
+                    ep.prioridade,
+                    ep.observacao,
+                    cp.id_olist AS id,
+                    cp.descricao,
+                    cp.unidade,
+                    cp.gtin,
+                    cp.preco,
+                    cp.preco_promocional,
+                    cp.preco_efetivo,
+                    cp.preco_disponivel,
+                    cp.ativo,
+                    cp.sincronizado_em
+                FROM comercial.encarte_produtos ep
+                JOIN comercial.olist_catalogo_produtos cp
+                    ON cp.sku = ep.sku
+                WHERE ep.ativo = TRUE
+                  AND cp.ativo = TRUE
+                  AND ep.sku <> ALL(%s::TEXT[])
+                ORDER BY
+                    ep.prioridade ASC,
+                    MD5(
+                        ep.sku
+                        || CURRENT_DATE::TEXT
+                    )
+                LIMIT %s;
+                """,
+                (
+                    sorted(excluidos),
+                    max(quantidade * 4, 24),
+                ),
+            )
+            candidatos = cursor.fetchall()
+        conexao.commit()
+
+    ofertas: list[dict[str, Any]] = []
+
+    for candidato in candidatos:
+        preco_oferta = (
+            normalizar_preco(
+                candidato.get("preco_promocional")
+            )
+            or normalizar_preco(
+                candidato.get("preco_efetivo")
+            )
+            or normalizar_preco(
+                candidato.get("preco")
+            )
+        )
+
+        # Regra validada: encarte ativo + preço de venda válido.
+        # Estoque não é consultado nem mencionado ao cliente.
+        if preco_oferta is None or preco_oferta <= 0:
+            continue
+
+        mensagem_sugerida = (
+            f"Também temos {candidato['descricao']} "
+            f"por R$ {preco_oferta:.2f} no encarte. "
+            "Quer aproveitar o preço e incluir algumas unidades?"
+        )
+
+        ofertas.append(
+            {
+                "encarte_item_id": candidato[
+                    "encarte_item_id"
+                ],
+                "id": candidato["id"],
+                "sku": candidato["sku"],
+                "descricao": candidato["descricao"],
+                "preco_normal": normalizar_preco(
+                    candidato.get("preco")
+                ),
+                "preco_promocional_catalogo": (
+                    normalizar_preco(
+                        candidato.get("preco_promocional")
+                    )
+                ),
+                "preco_oferta": preco_oferta,
+                "preco_efetivo": preco_oferta,
+                "preco_disponivel": True,
+                "origem_preco": "olist",
+                "preco_editavel": False,
+                "estoque_considerado": False,
+                "disponibilidade_comercial": (
+                    "nao_considerada"
+                ),
+                "prioridade": candidato["prioridade"],
+                "observacao": candidato["observacao"],
+                "mensagem_sugerida": (
+                    mensagem_sugerida.replace(".", ",", 1)
+                ),
+            }
+        )
+
+        if len(ofertas) >= quantidade:
+            break
+
+    return {
+        "status": (
+            "ofertas_disponiveis"
+            if ofertas
+            else "sem_ofertas_disponiveis"
+        ),
+        "configuracao": configuracao,
+        "quantidade_solicitada": quantidade,
+        "quantidade_retornada": len(ofertas),
+        "quantidade_minima_atingida": len(ofertas) >= 3,
+        "estoque_considerado": False,
+        "candidatos_verificados": len(candidatos),
+        "ofertas": ofertas,
+    }
+
+
+@app.get(
+    "/olist/status",
+    tags=["Olist"],
+    dependencies=[Depends(validar_api_key)],
+)
+def status_olist() -> dict[str, Any]:
+    configuracao = {
+        "api_base_url": OLIST_API_BASE_URL,
+        "redirect_uri": OLIST_REDIRECT_URI or None,
+        "client_id_configurado": bool(OLIST_CLIENT_ID),
+        "client_secret_configurado": bool(OLIST_CLIENT_SECRET),
+        "chave_criptografia_configurada": bool(
+            OLIST_TOKEN_CRYPTO_KEY
+        ),
+        "id_lista_preco": (
+            int(OLIST_ID_LISTA_PRECO)
+            if OLIST_ID_LISTA_PRECO.isdigit()
+            else None
+        ),
+    }
+
+    token = None
+    if OLIST_TOKEN_CRYPTO_KEY:
+        with obter_conexao() as conexao:
+            with conexao.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        token_type,
+                        scope,
+                        expira_em,
+                        refresh_expira_em,
+                        atualizado_em
+                    FROM comercial.olist_oauth_tokens
+                    WHERE id = 1;
+                    """
+                )
+                token = cursor.fetchone()
+
+    agora = datetime.now(timezone.utc)
+    return {
+        "configuracao": configuracao,
+        "autorizado": token is not None,
+        "access_token_valido": bool(
+            token and token["expira_em"] > agora
+        ),
+        "refresh_token_valido": bool(
+            token and token["refresh_expira_em"] > agora
+        ),
+        "token": token,
+    }
+
+
+@app.post(
+    "/olist/oauth/iniciar",
+    tags=["Olist"],
+    dependencies=[Depends(validar_api_key)],
+)
+def iniciar_oauth_olist() -> dict[str, Any]:
+    validar_configuracao_olist()
+
+    state = uuid4()
+    expira_em = datetime.now(timezone.utc) + timedelta(
+        minutes=15
+    )
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM comercial.olist_oauth_states
+                WHERE expira_em < NOW()
+                   OR usado_em IS NOT NULL;
+                """
+            )
+            cursor.execute(
+                """
+                INSERT INTO comercial.olist_oauth_states (
+                    state,
+                    expira_em
+                )
+                VALUES (%s, %s);
+                """,
+                (state, expira_em),
+            )
+        conexao.commit()
+
+    parametros = urllib.parse.urlencode(
+        {
+            "client_id": OLIST_CLIENT_ID,
+            "redirect_uri": OLIST_REDIRECT_URI,
+            "scope": OLIST_SCOPE,
+            "response_type": "code",
+            "state": str(state),
+        }
+    )
+    return {
+        "authorization_url": f"{OLIST_AUTH_URL}?{parametros}",
+        "state": state,
+        "expira_em": expira_em,
+    }
+
+
+@app.get(
+    "/olist/oauth/callback",
+    tags=["Olist"],
+)
+def callback_oauth_olist(
+    code: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    error: str | None = Query(default=None),
+    error_description: str | None = Query(default=None),
+) -> Response:
+    if error:
+        return Response(
+            content=(
+                "<h1>Autorização Olist não concluída</h1>"
+                f"<p>{error}: {error_description or ''}</p>"
+            ),
+            status_code=400,
+            media_type="text/html",
+        )
+
+    if not code or not state:
+        return Response(
+            content=(
+                "<h1>Parâmetros OAuth ausentes</h1>"
+                "<p>Não foram recebidos code e state.</p>"
+            ),
+            status_code=400,
+            media_type="text/html",
+        )
+
+    try:
+        state_uuid = UUID(state)
+    except ValueError:
+        return Response(
+            content="<h1>State OAuth inválido</h1>",
+            status_code=400,
+            media_type="text/html",
+        )
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT state
+                FROM comercial.olist_oauth_states
+                WHERE state = %s
+                  AND usado_em IS NULL
+                  AND expira_em > NOW()
+                FOR UPDATE;
+                """,
+                (state_uuid,),
+            )
+            registro_state = cursor.fetchone()
+
+            if registro_state is None:
+                return Response(
+                    content=(
+                        "<h1>Autorização expirada ou inválida</h1>"
+                        "<p>Inicie novamente pela API Comercial.</p>"
+                    ),
+                    status_code=400,
+                    media_type="text/html",
+                )
+
+            retorno = solicitar_token_olist(
+                {
+                    "grant_type": "authorization_code",
+                    "client_id": OLIST_CLIENT_ID,
+                    "client_secret": OLIST_CLIENT_SECRET,
+                    "redirect_uri": OLIST_REDIRECT_URI,
+                    "code": code,
+                }
+            )
+            token_info = salvar_tokens_olist(
+                cursor,
+                retorno,
+            )
+            cursor.execute(
+                """
+                UPDATE comercial.olist_oauth_states
+                SET usado_em = NOW()
+                WHERE state = %s;
+                """,
+                (state_uuid,),
+            )
+
+        conexao.commit()
+
+    return Response(
+        content=(
+            "<h1>Olist conectada com sucesso</h1>"
+            "<p>Os tokens foram armazenados de forma criptografada "
+            "no PostgreSQL.</p>"
+            f"<p>Access token válido até: "
+            f"{token_info['expira_em'].isoformat()}</p>"
+            "<p>Você pode fechar esta página.</p>"
+        ),
+        media_type="text/html",
+    )
+
+
+@app.post(
+    "/olist/catalogo/sincronizar",
+    tags=["Olist"],
+    dependencies=[Depends(validar_api_key)],
+)
+def sincronizar_catalogo(
+    max_paginas: int = Query(
+        default=200,
+        ge=1,
+        le=1000,
+    ),
+) -> dict[str, Any]:
+    return sincronizar_catalogo_olist(max_paginas)
+
+
+@app.get(
+    "/olist/catalogo/status",
+    tags=["Olist"],
+    dependencies=[Depends(validar_api_key)],
+)
+def status_catalogo_olist() -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER (
+                        WHERE ativo = TRUE
+                    ) AS produtos_ativos,
+                    COUNT(*) FILTER (
+                        WHERE ativo = TRUE
+                          AND preco_disponivel = TRUE
+                    ) AS produtos_com_preco,
+                    MAX(sincronizado_em) FILTER (
+                        WHERE ativo = TRUE
+                    ) AS ultima_atualizacao
+                FROM comercial.olist_catalogo_produtos;
+                """
+            )
+            resumo = cursor.fetchone()
+
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    status,
+                    inicio_em,
+                    fim_em,
+                    paginas,
+                    total_informado_olist,
+                    total_recebido,
+                    total_gravado,
+                    duracao_ms,
+                    erro,
+                    rate_limit
+                FROM comercial.olist_catalogo_sincronizacoes
+                ORDER BY inicio_em DESC
+                LIMIT 1;
+                """
+            )
+            ultima = cursor.fetchone()
+
+    return {
+        **resumo,
+        "ultima_sincronizacao": ultima,
+    }
+
+
+@app.get(
+    "/olist/catalogo/produto/{codigo}",
+    tags=["Olist"],
+    dependencies=[Depends(validar_api_key)],
+)
+def obter_produto_catalogo_por_codigo(
+    codigo: str,
+) -> dict[str, Any]:
+    codigo_limpo = codigo.strip()
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id_olist AS id,
+                    sku,
+                    descricao,
+                    unidade,
+                    gtin,
+                    preco,
+                    preco_promocional,
+                    preco_efetivo,
+                    preco_disponivel,
+                    localizacao,
+                    ativo,
+                    sincronizado_em
+                FROM comercial.olist_catalogo_produtos
+                WHERE sku = %s
+                   OR id_olist::text = %s
+                ORDER BY ativo DESC
+                LIMIT 1;
+                """,
+                (codigo_limpo, codigo_limpo),
+            )
+            produto_catalogo = cursor.fetchone()
+
+    if produto_catalogo is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Produto não localizado no catálogo sincronizado.",
+        )
+
+    return produto_catalogo
+
+
+@app.get(
+    "/olist/marketing/produto/{codigo}",
+    tags=["Olist", "Marketing"],
+    dependencies=[Depends(validar_api_key)],
+)
+def obter_produto_marketing_por_codigo(
+    codigo: str,
+    consultar_detalhes: bool = Query(default=True),
+    consultar_estoque: bool = Query(default=True),
+) -> dict[str, Any]:
+    codigo_limpo = codigo.strip()
+    if not codigo_limpo:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Informe o código/SKU ou ID do produto.",
+        )
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id_olist AS id,
+                    sku,
+                    descricao,
+                    unidade,
+                    gtin,
+                    preco,
+                    preco_promocional,
+                    preco_efetivo,
+                    preco_disponivel,
+                    localizacao,
+                    data_criacao_olist,
+                    data_alteracao_olist,
+                    dados,
+                    ativo,
+                    sincronizado_em
+                FROM comercial.olist_catalogo_produtos
+                WHERE sku = %s
+                   OR id_olist::text = %s
+                ORDER BY ativo DESC
+                LIMIT 1;
+                """,
+                (codigo_limpo, codigo_limpo),
+            )
+            produto_catalogo = cursor.fetchone()
+
+    if produto_catalogo is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=(
+                "Produto não localizado no catálogo sincronizado. "
+                "Sincronize o catálogo Olist e tente novamente."
+            ),
+        )
+
+    avisos: list[str] = []
+    detalhe_olist: dict[str, Any] = {}
+    detalhe_ao_vivo = False
+
+    if consultar_detalhes:
+        try:
+            retorno_detalhe, _ = requisicao_get_olist(
+                f"produtos/{produto_catalogo['id']}",
+            )
+            detalhe_olist = _extrair_objeto_produto_olist(
+                retorno_detalhe
+            )
+            detalhe_ao_vivo = bool(detalhe_olist)
+        except HTTPException as erro:
+            avisos.append(
+                "Não foi possível carregar os detalhes ao vivo do "
+                f"produto na Olist: {erro.detail}"
+            )
+
+    dados_catalogo = produto_catalogo.get("dados")
+    if not isinstance(dados_catalogo, dict):
+        dados_catalogo = {}
+
+    dados_referencia = {
+        "detalhe_olist": detalhe_olist,
+        "catalogo_sincronizado": dados_catalogo,
+    }
+
+    produto_com_estoque: dict[str, Any] = {
+        "id": produto_catalogo["id"],
+        "sku": produto_catalogo.get("sku"),
+        "descricao": produto_catalogo.get("descricao"),
+        "unidade": produto_catalogo.get("unidade"),
+        "gtin": produto_catalogo.get("gtin"),
+        "preco": produto_catalogo.get("preco"),
+        "preco_promocional": produto_catalogo.get(
+            "preco_promocional"
+        ),
+        "preco_efetivo": produto_catalogo.get(
+            "preco_efetivo"
+        ),
+        "preco_disponivel": produto_catalogo.get(
+            "preco_disponivel"
+        ),
+        "localizacao": produto_catalogo.get("localizacao"),
+    }
+    estoque_ao_vivo = False
+
+    if consultar_estoque:
+        try:
+            produto_com_estoque, _ = enriquecer_estoque_catalogo(
+                produto_com_estoque
+            )
+            estoque_ao_vivo = True
+        except HTTPException as erro:
+            avisos.append(
+                "Não foi possível carregar o estoque ao vivo do "
+                f"produto na Olist: {erro.detail}"
+            )
+
+    marca = _texto_valor_olist(
+        _buscar_valor_olist(
+            dados_referencia,
+            "marca",
+            "brand",
+        )
+    )
+    categoria = _texto_valor_olist(
+        _buscar_valor_olist(
+            dados_referencia,
+            "categoria",
+            "categoriaProduto",
+            "descricaoCategoria",
+        )
+    )
+    descricao_complementar = _texto_valor_olist(
+        _buscar_valor_olist(
+            dados_referencia,
+            "descricaoComplementar",
+            "descricao_complementar",
+            "descricaoDetalhada",
+            "descricao_detalhada",
+        )
+    )
+    imagens = _coletar_urls_midia_olist(dados_referencia)
+    caracteristicas = _caracteristicas_marketing_olist(
+        dados_referencia
+    )
+
+    if not imagens:
+        avisos.append(
+            "Nenhuma URL de imagem foi localizada nos dados retornados "
+            "pela Olist para este produto."
+        )
+
+    pendencias_marketing: list[str] = []
+    if not imagens:
+        pendencias_marketing.append("imagem_produto")
+    if not marca:
+        pendencias_marketing.append("marca")
+    if not categoria:
+        pendencias_marketing.append("categoria")
+
+    return {
+        "codigo_consultado": codigo_limpo,
+        "produto": {
+            "id_olist": produto_catalogo["id"],
+            "sku": produto_catalogo.get("sku"),
+            "gtin": produto_catalogo.get("gtin"),
+            "titulo": produto_catalogo.get("descricao"),
+            "descricao": produto_catalogo.get("descricao"),
+            "descricao_complementar": descricao_complementar,
+            "marca": marca,
+            "categoria": categoria,
+            "unidade": produto_catalogo.get("unidade"),
+            "ativo": produto_catalogo.get("ativo"),
+        },
+        "precos": {
+            "preco": produto_com_estoque.get("preco"),
+            "preco_promocional": produto_com_estoque.get(
+                "preco_promocional"
+            ),
+            "preco_efetivo": produto_com_estoque.get(
+                "preco_efetivo"
+            ),
+            "preco_disponivel": produto_com_estoque.get(
+                "preco_disponivel"
+            ),
+        },
+        "estoque": produto_com_estoque.get("estoque") or {
+            "localizacao": produto_catalogo.get("localizacao"),
+            "status": "nao_consultado",
+        },
+        "midias": {
+            "imagem_principal": imagens[0] if imagens else None,
+            "imagens": imagens,
+            "quantidade": len(imagens),
+        },
+        "caracteristicas": caracteristicas,
+        "datas": {
+            "criacao_olist": produto_catalogo.get(
+                "data_criacao_olist"
+            ),
+            "alteracao_olist": produto_catalogo.get(
+                "data_alteracao_olist"
+            ),
+            "catalogo_sincronizado_em": produto_catalogo.get(
+                "sincronizado_em"
+            ),
+        },
+        "marketing_rbk": {
+            "segmento": "Floresta e Jardim",
+            "formato": "1:1",
+            "resolucao_recomendada": "1200x1200",
+            "peso_maximo_bytes": 2 * 1024 * 1024,
+            "sequencia": [
+                "/marketplace",
+                "/adcreative",
+                "/compatibility",
+                "/features",
+                "/premium",
+                "/explodedview",
+            ],
+            "explodedview_quando_aplicavel": True,
+        },
+        "origem_dados": {
+            "catalogo_local": True,
+            "detalhe_olist_ao_vivo": detalhe_ao_vivo,
+            "estoque_olist_ao_vivo": estoque_ao_vivo,
+        },
+        "pronto_para_marketing": not pendencias_marketing,
+        "pendencias_marketing": pendencias_marketing,
+        "avisos": avisos,
+    }
+
+
+@app.get(
+    "/olist/produtos/pesquisar",
+    tags=["Olist"],
+    dependencies=[Depends(validar_api_key)],
+)
+def pesquisar_produtos(
+    termo: str | None = Query(
+        default=None,
+        min_length=2,
+        max_length=200,
+    ),
+    produto: str | None = Query(
+        default=None,
+        min_length=2,
+        max_length=120,
+    ),
+    marca: str | None = Query(
+        default=None,
+        min_length=1,
+        max_length=80,
+    ),
+    modelo: str | None = Query(
+        default=None,
+        min_length=1,
+        max_length=80,
+    ),
+    limite: int = Query(default=5, ge=1, le=10),
+    consultar_estoque: bool = Query(
+        default=True,
+        description=(
+            "Quando falso, usa somente o catálogo local para "
+            "reduzir a latência do atendimento por voz."
+        ),
+    ),
+) -> dict[str, Any]:
+    resultado = pesquisar_produtos_olist(
+        termo=termo,
+        produto=produto,
+        marca=marca,
+        modelo=modelo,
+        limite=limite,
+        consultar_estoque=consultar_estoque,
+    )
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO comercial.consultas_olist (
+                    termo,
+                    produto,
+                    marca,
+                    modelo,
+                    status,
+                    quantidade_resultados,
+                    duracao_ms,
+                    resposta
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s
+                )
+                RETURNING id;
+                """,
+                (
+                    termo,
+                    produto,
+                    marca,
+                    modelo,
+                    resultado["status"],
+                    resultado["quantidade_resultados"],
+                    resultado["duracao_ms"],
+                    Jsonb(jsonable_encoder(resultado)),
+                ),
+            )
+            consulta_id = cursor.fetchone()["id"]
+        conexao.commit()
+
+    return {
+        "consulta_id": consulta_id,
+        **resultado,
+    }
+
+
+@app.get(
+    "/vendedores",
+    tags=["Vendedores"],
+    dependencies=[Depends(validar_api_key)],
+)
+def listar_vendedores() -> list[dict[str, Any]]:
+    consulta = """
+        SELECT
+            v.id,
+            v.nome,
+            v.nome_exibicao,
+            v.codigo,
+            v.ativo,
+            v.uf_principal,
+            v.meta_contatos_dia,
+            v.tipo_telefonia,
+            v.horario_inicio,
+            v.horario_fim,
+            v.timezone,
+            COALESCE(
+                jsonb_agg(
+                    DISTINCT jsonb_build_object(
+                        'uf', t.uf,
+                        'ativo', t.ativo,
+                        'cidades', t.cidades
+                    )
+                ) FILTER (WHERE t.id IS NOT NULL),
+                '[]'::jsonb
+            ) AS territorios
+        FROM comercial.vendedores_ia v
+        LEFT JOIN comercial.territorios_vendedor t
+            ON t.vendedor_id = v.id
+        GROUP BY v.id
+        ORDER BY v.nome;
+    """
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(consulta)
+            return cursor.fetchall()
+
+
+@app.get(
+    "/vendedores/{codigo}",
+    tags=["Vendedores"],
+    dependencies=[Depends(validar_api_key)],
+)
+def buscar_vendedor(codigo: str) -> dict[str, Any]:
+    consulta = """
+        SELECT
+            v.id,
+            v.nome,
+            v.nome_exibicao,
+            v.codigo,
+            v.ativo,
+            v.uf_principal,
+            v.meta_contatos_dia,
+            v.limite_chamadas_simultaneas,
+            v.tipo_telefonia,
+            v.horario_inicio,
+            v.horario_fim,
+            v.timezone,
+            COALESCE(
+                jsonb_agg(
+                    DISTINCT jsonb_build_object(
+                        'uf', t.uf,
+                        'ativo', t.ativo,
+                        'cidades', t.cidades
+                    )
+                ) FILTER (WHERE t.id IS NOT NULL),
+                '[]'::jsonb
+            ) AS territorios
+        FROM comercial.vendedores_ia v
+        LEFT JOIN comercial.territorios_vendedor t
+            ON t.vendedor_id = v.id
+        WHERE v.codigo = %s
+        GROUP BY v.id;
+    """
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(consulta, (codigo.upper(),))
+            vendedor = cursor.fetchone()
+
+    if vendedor is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Vendedor não encontrado.",
+        )
+
+    return vendedor
+
+
+@app.get(
+    "/configuracoes/{chave}",
+    tags=["Configurações"],
+    dependencies=[Depends(validar_api_key)],
+)
+def buscar_configuracao(chave: str) -> dict[str, Any]:
+    consulta = """
+        SELECT chave, valor, descricao, atualizado_em
+        FROM comercial.configuracoes
+        WHERE chave = %s;
+    """
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(consulta, (chave,))
+            configuracao = cursor.fetchone()
+
+    if configuracao is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Configuração não encontrada.",
+        )
+
+    return configuracao
+
+
+@app.post(
+    "/orcamentos-ia/rascunho/itens",
+    tags=["Orçamentos IA"],
+    dependencies=[Depends(validar_api_key)],
+)
+def adicionar_item_orcamento_ia(
+    dados: OrcamentoIAItemAdicionar,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            obter_cliente_por_id(
+                cursor,
+                dados.cliente_id,
+            )
+            vendedor = obter_vendedor_por_codigo(
+                cursor,
+                dados.vendedor_codigo,
+            )
+            produto = buscar_produto_catalogo_exato(
+                cursor,
+                dados.sku,
+            )
+
+            if produto is None or not produto.get("ativo"):
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail=(
+                        "SKU não localizado ou inativo no "
+                        "catálogo sincronizado."
+                    ),
+                )
+
+            valor_unitario = (
+                normalizar_preco(
+                    produto.get("preco_promocional")
+                )
+                or normalizar_preco(
+                    produto.get("preco_efetivo")
+                )
+                or normalizar_preco(
+                    produto.get("preco")
+                )
+            )
+
+            if valor_unitario is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail=(
+                        "O produto não possui preço de venda válido."
+                    ),
+                )
+
+            orcamento = obter_ou_criar_orcamento_ia(
+                cursor,
+                dados.chamada_externa_id,
+                dados.cliente_id,
+                vendedor["id"],
+            )
+            quantidade = round(float(dados.quantidade), 3)
+            valor_total = round(
+                quantidade * valor_unitario,
+                2,
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.orcamento_itens_ia (
+                    orcamento_id,
+                    sku,
+                    produto_id_olist,
+                    descricao,
+                    quantidade,
+                    valor_unitario,
+                    valor_total,
+                    origem,
+                    disponibilidade,
+                    dados_adicionais
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s
+                )
+                ON CONFLICT (orcamento_id, sku) DO UPDATE
+                SET
+                    quantidade = (
+                        comercial.orcamento_itens_ia.quantidade
+                        + EXCLUDED.quantidade
+                    ),
+                    produto_id_olist = EXCLUDED.produto_id_olist,
+                    descricao = EXCLUDED.descricao,
+                    valor_unitario = EXCLUDED.valor_unitario,
+                    valor_total = ROUND(
+                        (
+                            comercial.orcamento_itens_ia.quantidade
+                            + EXCLUDED.quantidade
+                        )
+                        * EXCLUDED.valor_unitario,
+                        2
+                    ),
+                    origem = EXCLUDED.origem,
+                    disponibilidade = EXCLUDED.disponibilidade,
+                    dados_adicionais = (
+                        comercial.orcamento_itens_ia.dados_adicionais
+                        || EXCLUDED.dados_adicionais
+                    ),
+                    atualizado_em = NOW();
+                """,
+                (
+                    orcamento["id"],
+                    produto["sku"],
+                    produto["id"],
+                    produto["descricao"],
+                    quantidade,
+                    valor_unitario,
+                    valor_total,
+                    dados.origem,
+                    dados.disponibilidade,
+                    Jsonb(dados.dados_adicionais),
+                ),
+            )
+
+            recalcular_orcamento_ia(
+                cursor,
+                orcamento["id"],
+            )
+            detalhado = obter_orcamento_ia_detalhado(
+                cursor,
+                orcamento["id"],
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    vendedor_id,
+                    cliente_id,
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'adicionar_item_orcamento',
+                    'gateway_voz',
+                    %s,
+                    %s,
+                    TRUE
+                );
+                """,
+                (
+                    vendedor["id"],
+                    dados.cliente_id,
+                    Jsonb(
+                        {
+                            "chamada_externa_id": (
+                                dados.chamada_externa_id
+                            ),
+                            "sku": produto["sku"],
+                            "quantidade": quantidade,
+                            "origem": dados.origem,
+                        }
+                    ),
+                    Jsonb(
+                        {
+                            "orcamento_id": str(
+                                orcamento["id"]
+                            ),
+                            "valor_unitario": valor_unitario,
+                            "valor_total": valor_total,
+                        }
+                    ),
+                ),
+            )
+
+        conexao.commit()
+
+    return {
+        "adicionado": True,
+        "orcamento": detalhado,
+    }
+
+
+@app.get(
+    "/orcamentos-ia/rascunho/{chamada_externa_id}",
+    tags=["Orçamentos IA"],
+    dependencies=[Depends(validar_api_key)],
+)
+def consultar_orcamento_ia(
+    chamada_externa_id: str,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id
+                FROM comercial.orcamentos_ia
+                WHERE chamada_externa_id = %s;
+                """,
+                (chamada_externa_id.strip(),),
+            )
+            registro = cursor.fetchone()
+
+            if registro is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail="Orçamento IA não encontrado.",
+                )
+
+            return obter_orcamento_ia_detalhado(
+                cursor,
+                registro["id"],
+            )
+
+
+@app.post(
+    "/orcamentos-ia/rascunho/finalizar",
+    tags=["Propostas Comerciais"],
+    dependencies=[Depends(validar_api_key)],
+)
+def finalizar_orcamento_ia(
+    dados: OrcamentoIAFinalizar,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, quantidade_linhas
+                FROM comercial.orcamentos_ia
+                WHERE chamada_externa_id = %s
+                FOR UPDATE;
+                """,
+                (dados.chamada_externa_id,),
+            )
+            orcamento = cursor.fetchone()
+
+            if orcamento is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail="Orçamento IA não encontrado.",
+                )
+
+            if (
+                dados.status != "cancelado"
+                and orcamento["quantidade_linhas"] <= 0
+            ):
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail="A proposta não possui itens.",
+                )
+
+            novo_status = (
+                "cancelado"
+                if dados.status == "cancelado"
+                else "confirmado"
+            )
+
+            cursor.execute(
+                """
+                UPDATE comercial.orcamentos_ia
+                SET
+                    status = %s,
+                    confirmado_em = CASE
+                        WHEN %s = 'confirmado'
+                        THEN COALESCE(confirmado_em, NOW())
+                        ELSE confirmado_em
+                    END,
+                    atualizado_em = NOW()
+                WHERE id = %s;
+                """,
+                (
+                    novo_status,
+                    novo_status,
+                    orcamento["id"],
+                ),
+            )
+            orcamento_id = orcamento["id"]
+        conexao.commit()
+
+    if dados.status == "cancelado":
+        with obter_conexao() as conexao:
+            with conexao.cursor() as cursor:
+                detalhado = obter_orcamento_ia_detalhado(
+                    cursor,
+                    orcamento_id,
+                )
+
+        return {
+            "finalizado": True,
+            "orcamento": detalhado,
+            "proposta_comercial": None,
+            "proxima_etapa": None,
+        }
+
+    proposta = preparar_proposta_comercial(
+        orcamento_id
+    )
+
+    return {
+        "finalizado": True,
+        "orcamento": proposta["proposta"],
+        "proposta_comercial": proposta,
+        "proxima_etapa": "revisar_proposta_comercial",
+    }
+
+
+@app.get(
+    "/olist/vendedores/padrao",
+    tags=["Propostas Comerciais"],
+    dependencies=[Depends(validar_api_key)],
+)
+def consultar_vendedor_padrao_olist() -> dict[str, Any]:
+    return resolver_vendedor_padrao_olist()
+
+
+
+@app.get(
+    "/olist/vendedores/diagnostico",
+    tags=["Propostas Comerciais"],
+    dependencies=[Depends(validar_api_key)],
+)
+def diagnosticar_vendedores_olist(
+    nome: str | None = Query(
+        default=None,
+        description=(
+            "Filtro parcial opcional pelo nome do vendedor."
+        ),
+    ),
+) -> dict[str, Any]:
+    vendedores, limites = (
+        listar_vendedores_olist_completo(nome)
+    )
+
+    return {
+        "quantidade": len(vendedores),
+        "filtro_nome": nome,
+        "configuracao_atual": {
+            "nome": OLIST_VENDEDOR_PADRAO_NOME,
+            "codigo": OLIST_VENDEDOR_PADRAO_CODIGO,
+            "id": OLIST_VENDEDOR_PADRAO_ID or None,
+        },
+        "itens": vendedores,
+        "rate_limit": limites,
+    }
+
+
+@app.get(
+    "/propostas-comerciais",
+    tags=["Propostas Comerciais"],
+    dependencies=[Depends(validar_api_key)],
+)
+def listar_propostas_comerciais(
+    status_proposta: str | None = Query(
+        default=None,
+        alias="status",
+    ),
+    limite: int = Query(
+        default=50,
+        ge=1,
+        le=200,
+    ),
+) -> dict[str, Any]:
+    filtros = [
+        "o.numero_proposta IS NOT NULL",
+    ]
+    parametros: list[Any] = []
+
+    if status_proposta:
+        filtros.append("o.proposta_status = %s")
+        parametros.append(status_proposta)
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT
+                    o.id,
+                    o.numero_proposta,
+                    o.status,
+                    o.proposta_status,
+                    o.valor_total,
+                    o.quantidade_linhas,
+                    o.documento_consulta,
+                    o.olist_contato_id,
+                    o.olist_vendedor_id,
+                    o.olist_vendedor_nome,
+                    o.cliente_localizado_olist,
+                    o.proposta_criada_em,
+                    o.revisado_em,
+                    c.razao_social,
+                    c.nome_fantasia,
+                    c.nome_contato,
+                    c.cpf_cnpj,
+                    v.nome_exibicao AS agente_virtual
+                FROM comercial.orcamentos_ia o
+                JOIN comercial.clientes c
+                    ON c.id = o.cliente_id
+                JOIN comercial.vendedores_ia v
+                    ON v.id = o.vendedor_id
+                WHERE {" AND ".join(filtros)}
+                ORDER BY
+                    o.proposta_criada_em DESC NULLS LAST,
+                    o.criado_em DESC
+                LIMIT %s;
+                """,
+                [*parametros, limite],
+            )
+            itens = cursor.fetchall()
+
+    return {
+        "quantidade": len(itens),
+        "itens": itens,
+    }
+
+
+@app.get(
+    "/propostas-comerciais/{proposta_id}",
+    tags=["Propostas Comerciais"],
+    dependencies=[Depends(validar_api_key)],
+)
+def consultar_proposta_comercial(
+    proposta_id: UUID,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            return obter_orcamento_ia_detalhado(
+                cursor,
+                proposta_id,
+            )
+
+
+@app.patch(
+    "/propostas-comerciais/{proposta_id}/revisao",
+    tags=["Propostas Comerciais"],
+    dependencies=[Depends(validar_api_key)],
+)
+def revisar_proposta_comercial(
+    proposta_id: UUID,
+    dados: PropostaComercialRevisar,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE comercial.orcamentos_ia
+                SET
+                    proposta_status = %s,
+                    observacao_revisao = %s,
+                    revisado_em = CASE
+                        WHEN %s = 'revisada'
+                        THEN NOW()
+                        ELSE revisado_em
+                    END,
+                    atualizado_em = NOW()
+                WHERE id = %s
+                  AND numero_proposta IS NOT NULL
+                RETURNING id;
+                """,
+                (
+                    dados.status,
+                    (
+                        dados.observacao_revisao.strip()
+                        if dados.observacao_revisao
+                        else None
+                    ),
+                    dados.status,
+                    proposta_id,
+                ),
+            )
+            atualizado = cursor.fetchone()
+
+            if atualizado is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail="Proposta comercial não encontrada.",
+                )
+
+            detalhado = obter_orcamento_ia_detalhado(
+                cursor,
+                proposta_id,
+            )
+        conexao.commit()
+
+    return detalhado
+
+
+@app.post(
+    "/clientes",
+    tags=["Clientes"],
+    status_code=http_status.HTTP_201_CREATED,
+    dependencies=[Depends(validar_api_key)],
+)
+def criar_cliente(dados: ClienteCriar) -> dict[str, Any]:
+    vendedor_id = None
+
+    try:
+        with obter_conexao() as conexao:
+            with conexao.cursor() as cursor:
+                if dados.vendedor_codigo:
+                    vendedor = obter_vendedor_por_codigo(
+                        cursor,
+                        dados.vendedor_codigo,
+                    )
+                    vendedor_id = vendedor["id"]
+
+                cursor.execute(
+                    """
+                    INSERT INTO comercial.clientes (
+                        crm_origem_id,
+                        olist_id,
+                        tipo_pessoa,
+                        cpf_cnpj,
+                        razao_social,
+                        nome_fantasia,
+                        nome_contato,
+                        telefone,
+                        whatsapp,
+                        email,
+                        cidade,
+                        uf,
+                        vendedor_id,
+                        status,
+                        origem,
+                        dados_adicionais
+                    )
+                    VALUES (
+                        %(crm_origem_id)s,
+                        %(olist_id)s,
+                        %(tipo_pessoa)s,
+                        %(cpf_cnpj)s,
+                        %(razao_social)s,
+                        %(nome_fantasia)s,
+                        %(nome_contato)s,
+                        %(telefone)s,
+                        %(whatsapp)s,
+                        %(email)s,
+                        %(cidade)s,
+                        %(uf)s,
+                        %(vendedor_id)s,
+                        %(status)s,
+                        %(origem)s,
+                        %(dados_adicionais)s
+                    )
+                    RETURNING id;
+                    """,
+                    {
+                        **dados.model_dump(exclude={"vendedor_codigo", "dados_adicionais"}),
+                        "vendedor_id": vendedor_id,
+                        "dados_adicionais": Jsonb(dados.dados_adicionais),
+                    },
+                )
+                cliente_id = cursor.fetchone()["id"]
+                cliente = obter_cliente_por_id(cursor, cliente_id)
+
+            conexao.commit()
+            return cliente
+
+    except UniqueViolation as erro:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="Já existe um cliente com este CPF/CNPJ.",
+        ) from erro
+
+
+@app.get(
+    "/clientes",
+    tags=["Clientes"],
+    dependencies=[Depends(validar_api_key)],
+)
+def listar_clientes(
+    uf: str | None = Query(default=None, min_length=2, max_length=2),
+    status_cliente: str | None = Query(default=None, alias="status"),
+    vendedor_codigo: str | None = Query(default=None),
+    limite: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    filtros = []
+    parametros: list[Any] = []
+
+    if uf:
+        filtros.append("c.uf = %s")
+        parametros.append(uf.upper())
+
+    if status_cliente:
+        filtros.append("c.status = %s")
+        parametros.append(status_cliente)
+
+    if vendedor_codigo:
+        filtros.append("v.codigo = %s")
+        parametros.append(vendedor_codigo.upper())
+
+    where_sql = f"WHERE {' AND '.join(filtros)}" if filtros else ""
+
+    consulta_total = f"""
+        SELECT COUNT(*) AS total
+        FROM comercial.clientes c
+        LEFT JOIN comercial.vendedores_ia v
+            ON v.id = c.vendedor_id
+        {where_sql};
+    """
+
+    consulta_itens = f"""
+        SELECT
+            c.*,
+            v.codigo AS vendedor_codigo,
+            v.nome_exibicao AS vendedor_nome
+        FROM comercial.clientes c
+        LEFT JOIN comercial.vendedores_ia v
+            ON v.id = c.vendedor_id
+        {where_sql}
+        ORDER BY c.criado_em DESC
+        LIMIT %s OFFSET %s;
+    """
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(consulta_total, parametros)
+            total = cursor.fetchone()["total"]
+
+            cursor.execute(
+                consulta_itens,
+                [*parametros, limite, offset],
+            )
+            itens = cursor.fetchall()
+
+    return {
+        "total": total,
+        "limite": limite,
+        "offset": offset,
+        "itens": itens,
+    }
+
+
+@app.get(
+    "/clientes/{cliente_id}",
+    tags=["Clientes"],
+    dependencies=[Depends(validar_api_key)],
+)
+def buscar_cliente(cliente_id: UUID) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            return obter_cliente_por_id(cursor, cliente_id)
+
+
+@app.patch(
+    "/clientes/{cliente_id}",
+    tags=["Clientes"],
+    dependencies=[Depends(validar_api_key)],
+)
+def atualizar_cliente(
+    cliente_id: UUID,
+    dados: ClienteAtualizar,
+) -> dict[str, Any]:
+    campos = dados.model_dump(exclude_unset=True)
+    vendedor_codigo_informado = "vendedor_codigo" in campos
+    vendedor_codigo = campos.pop("vendedor_codigo", None)
+
+    if "dados_adicionais" in campos and campos["dados_adicionais"] is not None:
+        campos["dados_adicionais"] = Jsonb(campos["dados_adicionais"])
+
+    if not campos and not vendedor_codigo_informado:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="Nenhum campo foi informado para atualização.",
+        )
+
+    try:
+        with obter_conexao() as conexao:
+            with conexao.cursor() as cursor:
+                obter_cliente_por_id(cursor, cliente_id)
+
+                if vendedor_codigo_informado:
+                    if vendedor_codigo is None:
+                        campos["vendedor_id"] = None
+                    else:
+                        vendedor = obter_vendedor_por_codigo(
+                            cursor,
+                            vendedor_codigo,
+                        )
+                        campos["vendedor_id"] = vendedor["id"]
+
+                atribuicoes = [
+                    f"{campo} = %s"
+                    for campo in campos.keys()
+                ]
+                valores = list(campos.values())
+
+                atribuicoes.append("atualizado_em = NOW()")
+
+                cursor.execute(
+                    f"""
+                    UPDATE comercial.clientes
+                    SET {", ".join(atribuicoes)}
+                    WHERE id = %s;
+                    """,
+                    [*valores, cliente_id],
+                )
+
+                cliente = obter_cliente_por_id(cursor, cliente_id)
+
+            conexao.commit()
+            return cliente
+
+    except UniqueViolation as erro:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail="Já existe um cliente com este CPF/CNPJ.",
+        ) from erro
+
+
+@app.post(
+    "/agendas",
+    tags=["Agenda"],
+    status_code=http_status.HTTP_201_CREATED,
+    dependencies=[Depends(validar_api_key)],
+)
+def criar_agenda(dados: AgendaCriar) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cliente = obter_cliente_por_id(cursor, dados.cliente_id)
+            vendedor = obter_vendedor_por_codigo(
+                cursor,
+                dados.vendedor_codigo,
+            )
+
+            if cliente["bloqueado"] or cliente["opt_out"]:
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail="O cliente está bloqueado ou solicitou opt-out.",
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.agendas_comerciais (
+                    cliente_id,
+                    vendedor_id,
+                    data_agenda,
+                    horario_previsto,
+                    prioridade,
+                    objetivo,
+                    canal_preferencial,
+                    maximo_tentativas,
+                    observacao
+                )
+                VALUES (
+                    %(cliente_id)s,
+                    %(vendedor_id)s,
+                    %(data_agenda)s,
+                    %(horario_previsto)s,
+                    %(prioridade)s,
+                    %(objetivo)s,
+                    %(canal_preferencial)s,
+                    %(maximo_tentativas)s,
+                    %(observacao)s
+                )
+                RETURNING id;
+                """,
+                {
+                    **dados.model_dump(exclude={"vendedor_codigo"}),
+                    "vendedor_id": vendedor["id"],
+                },
+            )
+            agenda_id = cursor.fetchone()["id"]
+
+            cursor.execute(
+                """
+                SELECT
+                    a.*,
+                    c.razao_social,
+                    c.nome_fantasia,
+                    c.nome_contato,
+                    c.telefone,
+                    c.whatsapp,
+                    c.cidade,
+                    c.uf,
+                    v.codigo AS vendedor_codigo,
+                    v.nome_exibicao AS vendedor_nome
+                FROM comercial.agendas_comerciais a
+                JOIN comercial.clientes c
+                    ON c.id = a.cliente_id
+                JOIN comercial.vendedores_ia v
+                    ON v.id = a.vendedor_id
+                WHERE a.id = %s;
+                """,
+                (agenda_id,),
+            )
+            agenda = cursor.fetchone()
+
+        conexao.commit()
+        return agenda
+
+
+@app.get(
+    "/agendas/proxima",
+    tags=["Agenda"],
+    dependencies=[Depends(validar_api_key)],
+)
+def buscar_proxima_agenda(
+    vendedor_codigo: str,
+    data_agenda: date | None = None,
+) -> dict[str, Any]:
+    data_consulta = data_agenda or datetime.now(FUSO_PROJETO).date()
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            vendedor = obter_vendedor_por_codigo(
+                cursor,
+                vendedor_codigo,
+            )
+
+            cursor.execute(
+                """
+                SELECT
+                    a.*,
+                    c.razao_social,
+                    c.nome_fantasia,
+                    c.nome_contato,
+                    c.telefone,
+                    c.whatsapp,
+                    c.cidade,
+                    c.uf,
+                    c.cpf_cnpj,
+                    c.dados_adicionais,
+                    v.codigo AS vendedor_codigo,
+                    v.nome_exibicao AS vendedor_nome
+                FROM comercial.agendas_comerciais a
+                JOIN comercial.clientes c
+                    ON c.id = a.cliente_id
+                JOIN comercial.vendedores_ia v
+                    ON v.id = a.vendedor_id
+                WHERE a.vendedor_id = %s
+                  AND a.data_agenda = %s
+                  AND a.status = 'pendente'
+                  AND c.bloqueado = FALSE
+                  AND c.opt_out = FALSE
+                ORDER BY
+                    a.prioridade ASC,
+                    a.horario_previsto NULLS LAST,
+                    a.criado_em ASC
+                LIMIT 1;
+                """,
+                (vendedor["id"], data_consulta),
+            )
+            agenda = cursor.fetchone()
+
+    if agenda is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Nenhuma agenda pendente encontrada para o vendedor e data informados.",
+        )
+
+    return agenda
+
+
+@app.get(
+    "/agendas",
+    tags=["Agenda"],
+    dependencies=[Depends(validar_api_key)],
+)
+def listar_agendas(
+    data_agenda: date | None = None,
+    vendedor_codigo: str | None = None,
+    status_agenda: str | None = Query(default=None, alias="status"),
+    limite: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    if status_agenda and status_agenda not in STATUS_AGENDA:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Status inválido. Use um destes: {', '.join(sorted(STATUS_AGENDA))}.",
+        )
+
+    filtros = []
+    parametros: list[Any] = []
+
+    if data_agenda:
+        filtros.append("a.data_agenda = %s")
+        parametros.append(data_agenda)
+
+    if vendedor_codigo:
+        filtros.append("v.codigo = %s")
+        parametros.append(vendedor_codigo.upper())
+
+    if status_agenda:
+        filtros.append("a.status = %s")
+        parametros.append(status_agenda)
+
+    where_sql = f"WHERE {' AND '.join(filtros)}" if filtros else ""
+
+    consulta_total = f"""
+        SELECT COUNT(*) AS total
+        FROM comercial.agendas_comerciais a
+        JOIN comercial.vendedores_ia v
+            ON v.id = a.vendedor_id
+        {where_sql};
+    """
+
+    consulta_itens = f"""
+        SELECT
+            a.*,
+            c.razao_social,
+            c.nome_fantasia,
+            c.nome_contato,
+            c.telefone,
+            c.whatsapp,
+            c.cidade,
+            c.uf,
+            v.codigo AS vendedor_codigo,
+            v.nome_exibicao AS vendedor_nome
+        FROM comercial.agendas_comerciais a
+        JOIN comercial.clientes c
+            ON c.id = a.cliente_id
+        JOIN comercial.vendedores_ia v
+            ON v.id = a.vendedor_id
+        {where_sql}
+        ORDER BY
+            a.data_agenda ASC,
+            a.prioridade ASC,
+            a.horario_previsto NULLS LAST,
+            a.criado_em ASC
+        LIMIT %s OFFSET %s;
+    """
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(consulta_total, parametros)
+            total = cursor.fetchone()["total"]
+
+            cursor.execute(
+                consulta_itens,
+                [*parametros, limite, offset],
+            )
+            itens = cursor.fetchall()
+
+    return {
+        "total": total,
+        "limite": limite,
+        "offset": offset,
+        "itens": itens,
+    }
+
+
+@app.patch(
+    "/agendas/{agenda_id}",
+    tags=["Agenda"],
+    dependencies=[Depends(validar_api_key)],
+)
+def atualizar_agenda(
+    agenda_id: UUID,
+    dados: AgendaAtualizar,
+) -> dict[str, Any]:
+    campos = dados.model_dump(exclude_unset=True)
+
+    if not campos:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="Nenhum campo foi informado para atualização.",
+        )
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id
+                FROM comercial.agendas_comerciais
+                WHERE id = %s;
+                """,
+                (agenda_id,),
+            )
+            if cursor.fetchone() is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail="Agenda não encontrada.",
+                )
+
+            atribuicoes = [
+                f"{campo} = %s"
+                for campo in campos.keys()
+            ]
+            valores = list(campos.values())
+            atribuicoes.append("atualizado_em = NOW()")
+
+            cursor.execute(
+                f"""
+                UPDATE comercial.agendas_comerciais
+                SET {", ".join(atribuicoes)}
+                WHERE id = %s;
+                """,
+                [*valores, agenda_id],
+            )
+
+            cursor.execute(
+                """
+                SELECT
+                    a.*,
+                    c.razao_social,
+                    c.nome_fantasia,
+                    c.nome_contato,
+                    c.telefone,
+                    c.whatsapp,
+                    c.cidade,
+                    c.uf,
+                    v.codigo AS vendedor_codigo,
+                    v.nome_exibicao AS vendedor_nome
+                FROM comercial.agendas_comerciais a
+                JOIN comercial.clientes c
+                    ON c.id = a.cliente_id
+                JOIN comercial.vendedores_ia v
+                    ON v.id = a.vendedor_id
+                WHERE a.id = %s;
+                """,
+                (agenda_id,),
+            )
+            agenda = cursor.fetchone()
+
+        conexao.commit()
+        return agenda
+
+
+@app.post(
+    "/agendas/assumir-proxima",
+    tags=["Agenda"],
+    dependencies=[Depends(validar_api_key)],
+)
+def assumir_proxima_agenda(
+    dados: AssumirProximaAgenda,
+) -> dict[str, Any]:
+    data_consulta = dados.data_agenda or datetime.now(FUSO_PROJETO).date()
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            vendedor = obter_vendedor_por_codigo(
+                cursor,
+                dados.vendedor_codigo,
+            )
+
+            cursor.execute(
+                """
+                SELECT a.id
+                FROM comercial.agendas_comerciais a
+                JOIN comercial.clientes c
+                    ON c.id = a.cliente_id
+                WHERE a.vendedor_id = %s
+                  AND a.data_agenda = %s
+                  AND a.status = 'pendente'
+                  AND a.numero_tentativas < a.maximo_tentativas
+                  AND c.bloqueado = FALSE
+                  AND c.opt_out = FALSE
+                ORDER BY
+                    a.prioridade ASC,
+                    a.horario_previsto NULLS LAST,
+                    a.criado_em ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1;
+                """,
+                (vendedor["id"], data_consulta),
+            )
+            selecionada = cursor.fetchone()
+
+            if selecionada is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail=(
+                        "Nenhuma agenda pendente disponível para o vendedor "
+                        "e data informados."
+                    ),
+                )
+
+            agenda_id = selecionada["id"]
+
+            cursor.execute(
+                """
+                UPDATE comercial.agendas_comerciais
+                SET
+                    status = 'em_execucao',
+                    numero_tentativas = numero_tentativas + 1,
+                    ultima_tentativa_em = NOW(),
+                    atualizado_em = NOW()
+                WHERE id = %s;
+                """,
+                (agenda_id,),
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    vendedor_id,
+                    cliente_id,
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso
+                )
+                SELECT
+                    a.vendedor_id,
+                    a.cliente_id,
+                    'assumir_agenda',
+                    'api_comercial',
+                    %s,
+                    %s,
+                    TRUE
+                FROM comercial.agendas_comerciais a
+                WHERE a.id = %s;
+                """,
+                (
+                    Jsonb(
+                        {
+                            "vendedor_codigo": dados.vendedor_codigo,
+                            "data_agenda": data_consulta.isoformat(),
+                        }
+                    ),
+                    Jsonb(
+                        {
+                            "agenda_id": str(agenda_id),
+                            "status": "em_execucao",
+                        }
+                    ),
+                    agenda_id,
+                ),
+            )
+
+            agenda = obter_agenda_detalhada(cursor, agenda_id)
+
+        conexao.commit()
+        return agenda
+
+
+@app.post(
+    "/agendas/{agenda_id}/liberar",
+    tags=["Agenda"],
+    dependencies=[Depends(validar_api_key)],
+)
+def liberar_agenda(
+    agenda_id: UUID,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            agenda = obter_agenda_detalhada(cursor, agenda_id)
+
+            if agenda["status"] != "em_execucao":
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail="Somente agendas em execução podem ser liberadas.",
+                )
+
+            cursor.execute(
+                """
+                UPDATE comercial.agendas_comerciais
+                SET
+                    status = 'pendente',
+                    atualizado_em = NOW()
+                WHERE id = %s;
+                """,
+                (agenda_id,),
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    vendedor_id,
+                    cliente_id,
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'liberar_agenda',
+                    'api_comercial',
+                    %s,
+                    %s,
+                    TRUE
+                );
+                """,
+                (
+                    agenda["vendedor_id"],
+                    agenda["cliente_id"],
+                    Jsonb({"agenda_id": str(agenda_id)}),
+                    Jsonb({"status": "pendente"}),
+                ),
+            )
+
+            agenda_atualizada = obter_agenda_detalhada(cursor, agenda_id)
+
+        conexao.commit()
+        return agenda_atualizada
+
+
+@app.post(
+    "/chamadas",
+    tags=["Chamadas"],
+    status_code=http_status.HTTP_201_CREATED,
+    dependencies=[Depends(validar_api_key)],
+)
+def iniciar_chamada(
+    dados: ChamadaIniciar,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            agenda = obter_agenda_detalhada(cursor, dados.agenda_id)
+
+            if agenda["status"] != "em_execucao":
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail=(
+                        "A agenda precisa estar em execução antes de iniciar "
+                        "a chamada."
+                    ),
+                )
+
+            numero_destino = dados.numero_destino or agenda["telefone"]
+
+            if not numero_destino:
+                raise HTTPException(
+                    status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="O cliente não possui telefone para a chamada.",
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.chamadas_ia (
+                    agenda_id,
+                    cliente_id,
+                    vendedor_id,
+                    provedor,
+                    chamada_externa_id,
+                    numero_origem,
+                    numero_destino,
+                    direcao,
+                    status,
+                    inicio_em
+                )
+                VALUES (
+                    %(agenda_id)s,
+                    %(cliente_id)s,
+                    %(vendedor_id)s,
+                    %(provedor)s,
+                    %(chamada_externa_id)s,
+                    %(numero_origem)s,
+                    %(numero_destino)s,
+                    'saida',
+                    %(status)s,
+                    NOW()
+                )
+                RETURNING id;
+                """,
+                {
+                    "agenda_id": dados.agenda_id,
+                    "cliente_id": agenda["cliente_id"],
+                    "vendedor_id": agenda["vendedor_id"],
+                    "provedor": dados.provedor,
+                    "chamada_externa_id": dados.chamada_externa_id,
+                    "numero_origem": dados.numero_origem,
+                    "numero_destino": numero_destino,
+                    "status": dados.status,
+                },
+            )
+            chamada_id = cursor.fetchone()["id"]
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    vendedor_id,
+                    cliente_id,
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'iniciar_chamada',
+                    'api_comercial',
+                    %s,
+                    %s,
+                    TRUE
+                );
+                """,
+                (
+                    agenda["vendedor_id"],
+                    agenda["cliente_id"],
+                    Jsonb(
+                        {
+                            "agenda_id": str(dados.agenda_id),
+                            "provedor": dados.provedor,
+                            "numero_destino": numero_destino,
+                        }
+                    ),
+                    Jsonb({"chamada_id": str(chamada_id)}),
+                ),
+            )
+
+            chamada = obter_chamada_detalhada(cursor, chamada_id)
+
+        conexao.commit()
+        return chamada
+
+
+@app.get(
+    "/chamadas",
+    tags=["Chamadas"],
+    dependencies=[Depends(validar_api_key)],
+)
+def listar_chamadas(
+    vendedor_codigo: str | None = None,
+    cliente_id: UUID | None = None,
+    status_chamada: str | None = Query(default=None, alias="status"),
+    data_inicio: date | None = None,
+    data_fim: date | None = None,
+    limite: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    if status_chamada and status_chamada not in STATUS_CHAMADA:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Status inválido. Use um destes: {', '.join(sorted(STATUS_CHAMADA))}.",
+        )
+
+    filtros: list[str] = []
+    parametros: list[Any] = []
+
+    if vendedor_codigo:
+        filtros.append("v.codigo = %s")
+        parametros.append(vendedor_codigo.upper())
+
+    if cliente_id:
+        filtros.append("ch.cliente_id = %s")
+        parametros.append(cliente_id)
+
+    if status_chamada:
+        filtros.append("ch.status = %s")
+        parametros.append(status_chamada)
+
+    if data_inicio:
+        filtros.append("ch.criado_em::date >= %s")
+        parametros.append(data_inicio)
+
+    if data_fim:
+        filtros.append("ch.criado_em::date <= %s")
+        parametros.append(data_fim)
+
+    where_sql = f"WHERE {' AND '.join(filtros)}" if filtros else ""
+
+    consulta_total = f"""
+        SELECT COUNT(*) AS total
+        FROM comercial.chamadas_ia ch
+        JOIN comercial.vendedores_ia v
+            ON v.id = ch.vendedor_id
+        {where_sql};
+    """
+
+    consulta_itens = f"""
+        SELECT
+            ch.*,
+            a.data_agenda,
+            a.status AS agenda_status,
+            c.razao_social,
+            c.nome_fantasia,
+            c.nome_contato,
+            c.telefone,
+            c.cidade,
+            c.uf,
+            v.codigo AS vendedor_codigo,
+            v.nome_exibicao AS vendedor_nome
+        FROM comercial.chamadas_ia ch
+        LEFT JOIN comercial.agendas_comerciais a
+            ON a.id = ch.agenda_id
+        JOIN comercial.clientes c
+            ON c.id = ch.cliente_id
+        JOIN comercial.vendedores_ia v
+            ON v.id = ch.vendedor_id
+        {where_sql}
+        ORDER BY ch.criado_em DESC
+        LIMIT %s OFFSET %s;
+    """
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(consulta_total, parametros)
+            total = cursor.fetchone()["total"]
+
+            cursor.execute(
+                consulta_itens,
+                [*parametros, limite, offset],
+            )
+            itens = cursor.fetchall()
+
+    return {
+        "total": total,
+        "limite": limite,
+        "offset": offset,
+        "itens": itens,
+    }
+
+
+def montar_resumo_conversa_voz(
+    estado: dict[str, Any],
+    levantamento_completo: bool,
+    resultado: str,
+) -> str:
+    partes: list[str] = []
+
+    campos = [
+        ("Cliente", estado.get("nome_cliente")),
+        ("Produto", estado.get("produto")),
+        ("Marca", estado.get("marca_maquina")),
+        ("Modelo", estado.get("modelo_maquina")),
+        ("Quantidade", estado.get("quantidade")),
+    ]
+
+    for rotulo, valor in campos:
+        if valor not in (None, "", [], {}):
+            partes.append(f"{rotulo}: {valor}")
+
+    dados_tecnicos = estado.get("dados_tecnicos")
+    if isinstance(dados_tecnicos, dict) and dados_tecnicos:
+        dados_formatados = ", ".join(
+            f"{chave}: {valor}"
+            for chave, valor in dados_tecnicos.items()
+            if valor not in (None, "", [], {})
+        )
+        if dados_formatados:
+            partes.append(f"Dados técnicos: {dados_formatados}")
+
+    partes.append(
+        "Levantamento técnico completo"
+        if levantamento_completo
+        else "Levantamento técnico incompleto"
+    )
+    partes.append(f"Resultado: {resultado}")
+
+    return "; ".join(partes)[:4000]
+
+
+def criar_venda_futura_da_chamada(
+    cursor,
+    chamada_id: UUID,
+    dados: ConversaVozRegistrar,
+    vendedor: dict[str, Any],
+    resumo: str,
+) -> dict[str, Any] | None:
+    configuracoes = {
+        "sem_opcao_comercializavel": {
+            "tipo": "verificar_disponibilidade",
+            "etapa": "aguardando_disponibilidade",
+            "prioridade": 1,
+            "probabilidade": 45,
+            "acao": (
+                "Verificar preço, estoque e previsão de reposição; "
+                "retornar ao cliente."
+            ),
+        },
+        "aguardando_disponibilidade": {
+            "tipo": "verificar_disponibilidade",
+            "etapa": "aguardando_disponibilidade",
+            "prioridade": 1,
+            "probabilidade": 45,
+            "acao": (
+                "Verificar preço, estoque e previsão de reposição; "
+                "retornar ao cliente."
+            ),
+        },
+        "produto_nao_encontrado": {
+            "tipo": "revisar_catalogo",
+            "etapa": "revisao_catalogo",
+            "prioridade": 2,
+            "probabilidade": 30,
+            "acao": (
+                "Revisar descrição, código e possíveis equivalências "
+                "no catálogo; retornar ao cliente."
+            ),
+        },
+        "revisao_catalogo": {
+            "tipo": "revisar_catalogo",
+            "etapa": "revisao_catalogo",
+            "prioridade": 2,
+            "probabilidade": 30,
+            "acao": (
+                "Revisar descrição, código e possíveis equivalências "
+                "no catálogo; retornar ao cliente."
+            ),
+        },
+        "falha_consulta_catalogo": {
+            "tipo": "revisar_integracao",
+            "etapa": "revisao_integracao",
+            "prioridade": 1,
+            "probabilidade": 35,
+            "acao": (
+                "Reprocessar a consulta ao catálogo e retornar ao cliente."
+            ),
+        },
+        "revisao_integracao": {
+            "tipo": "revisar_integracao",
+            "etapa": "revisao_integracao",
+            "prioridade": 1,
+            "probabilidade": 35,
+            "acao": (
+                "Reprocessar a consulta ao catálogo e retornar ao cliente."
+            ),
+        },
+    }
+
+    estado = dados.estado_comercial or {}
+    pendencias_durante_atendimento = estado.get(
+        "pendencias_catalogo"
+    )
+    if (
+        isinstance(pendencias_durante_atendimento, list)
+        and pendencias_durante_atendimento
+    ):
+        return None
+
+    configuracao = configuracoes.get(dados.resultado)
+    if configuracao is None:
+        return None
+    termo_busca = (
+        estado.get("termo_busca")
+        or estado.get("descricao_solicitada")
+        or estado.get("produto")
+        or "Produto solicitado pelo cliente"
+    )
+    ultima_consulta = estado.get("ultima_consulta_catalogo")
+    if not isinstance(ultima_consulta, dict):
+        ultima_consulta = {}
+
+    opcoes = (
+        ultima_consulta.get("opcoes_descartadas")
+        or ultima_consulta.get("opcoes_comercializaveis")
+        or ultima_consulta.get("opcoes")
+        or []
+    )
+    if not isinstance(opcoes, list):
+        opcoes = []
+
+    prazo_retorno = dados.fim_em + timedelta(hours=4)
+    titulo = f"Venda futura: {str(termo_busca)[:150]}"
+    descricao = (
+        f"{resumo}. Próxima ação: {configuracao['acao']}"
+    )[:4000]
+
+    cursor.execute(
+        """
+        INSERT INTO comercial.oportunidades (
+            cliente_id,
+            vendedor_id,
+            origem,
+            etapa,
+            titulo,
+            descricao,
+            probabilidade,
+            produtos,
+            proxima_acao,
+            proxima_acao_em
+        )
+        VALUES (
+            %s,
+            %s,
+            'agente_voz',
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s
+        )
+        RETURNING id;
+        """,
+        (
+            dados.cliente_id,
+            vendedor["id"],
+            configuracao["etapa"],
+            titulo,
+            descricao,
+            configuracao["probabilidade"],
+            Jsonb(opcoes),
+            configuracao["acao"],
+            prazo_retorno,
+        ),
+    )
+    oportunidade_id = cursor.fetchone()["id"]
+
+    cursor.execute(
+        """
+        INSERT INTO comercial.pendencias_comerciais (
+            oportunidade_id,
+            chamada_id,
+            cliente_id,
+            vendedor_id,
+            tipo,
+            prioridade,
+            status,
+            destinatario,
+            titulo,
+            descricao,
+            termo_busca,
+            estado_comercial,
+            opcoes_catalogo,
+            prazo_em
+        )
+        VALUES (
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            'pendente',
+            'gerente_ou_humano',
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s
+        )
+        ON CONFLICT (chamada_id, tipo) DO UPDATE
+        SET
+            atualizado_em = NOW()
+        RETURNING
+            id,
+            oportunidade_id,
+            tipo,
+            prioridade,
+            status,
+            destinatario,
+            prazo_em,
+            criado_em;
+        """,
+        (
+            oportunidade_id,
+            chamada_id,
+            dados.cliente_id,
+            vendedor["id"],
+            configuracao["tipo"],
+            configuracao["prioridade"],
+            titulo,
+            descricao,
+            str(termo_busca)[:300],
+            Jsonb(estado),
+            Jsonb(opcoes),
+            prazo_retorno,
+        ),
+    )
+    pendencia = cursor.fetchone()
+
+    cursor.execute(
+        """
+        UPDATE comercial.clientes
+        SET
+            status = CASE
+                WHEN status IN ('novo', 'teste_voz')
+                THEN 'oportunidade'
+                ELSE status
+            END,
+            proxima_acao_em = CASE
+                WHEN proxima_acao_em IS NULL
+                THEN %s
+                ELSE LEAST(proxima_acao_em, %s)
+            END,
+            atualizado_em = NOW()
+        WHERE id = %s;
+        """,
+        (
+            prazo_retorno,
+            prazo_retorno,
+            dados.cliente_id,
+        ),
+    )
+
+    cursor.execute(
+        """
+        INSERT INTO comercial.interacoes (
+            cliente_id,
+            vendedor_id,
+            canal,
+            direcao,
+            tipo,
+            resumo,
+            intencao,
+            mensagem_externa_id
+        )
+        VALUES (
+            %s,
+            %s,
+            'sistema',
+            'saida',
+            'pendencia_venda_futura',
+            %s,
+            'retorno_comercial',
+            %s
+        );
+        """,
+        (
+            dados.cliente_id,
+            vendedor["id"],
+            descricao,
+            f"{dados.chamada_externa_id}:pendencia",
+        ),
+    )
+
+    cursor.execute(
+        """
+        INSERT INTO comercial.acoes_agente (
+            vendedor_id,
+            cliente_id,
+            tipo_acao,
+            origem,
+            entrada,
+            saida,
+            sucesso
+        )
+        VALUES (
+            %s,
+            %s,
+            'criar_pendencia_venda_futura',
+            'persistencia_chamada_voz',
+            %s,
+            %s,
+            TRUE
+        );
+        """,
+        (
+            vendedor["id"],
+            dados.cliente_id,
+            Jsonb(
+                {
+                    "chamada_id": str(chamada_id),
+                    "resultado": dados.resultado,
+                    "termo_busca": termo_busca,
+                }
+            ),
+            Jsonb(
+                {
+                    "pendencia_id": str(pendencia["id"]),
+                    "oportunidade_id": str(oportunidade_id),
+                    "prazo_em": prazo_retorno.isoformat(),
+                }
+            ),
+        ),
+    )
+
+    return {
+        **pendencia,
+        "oportunidade_id": oportunidade_id,
+        "titulo": titulo,
+        "proxima_acao": configuracao["acao"],
+    }
+
+
+def criar_pendencia_catalogo_durante_atendimento(
+    cursor,
+    chamada_id: UUID,
+    dados: ConversaVozRegistrar,
+    vendedor: dict[str, Any],
+    resumo: str,
+) -> dict[str, Any] | None:
+    estado = dados.estado_comercial or {}
+    pendencias = estado.get("pendencias_catalogo")
+
+    if not isinstance(pendencias, list):
+        return None
+
+    pendencias_validas = [
+        item
+        for item in pendencias
+        if isinstance(item, dict)
+        and item.get("termo_busca")
+    ]
+    if not pendencias_validas:
+        return None
+
+    prazo_retorno = dados.fim_em + timedelta(hours=4)
+    quantidade = len(pendencias_validas)
+    termos = [
+        str(item.get("termo_busca"))[:150]
+        for item in pendencias_validas[:5]
+    ]
+    titulo = (
+        f"Revisar {quantidade} item(ns) do atendimento"
+    )
+    descricao = (
+        f"{resumo}. Itens para revisão: "
+        + "; ".join(termos)
+        + ". Retornar ao cliente após revisar preço, "
+        "cadastro ou integração."
+    )[:4000]
+
+    cursor.execute(
+        """
+        INSERT INTO comercial.oportunidades (
+            cliente_id,
+            vendedor_id,
+            origem,
+            etapa,
+            titulo,
+            descricao,
+            probabilidade,
+            produtos,
+            proxima_acao,
+            proxima_acao_em
+        )
+        VALUES (
+            %s,
+            %s,
+            'agente_voz',
+            'revisao_catalogo',
+            %s,
+            %s,
+            40,
+            %s,
+            'Revisar itens pendentes e retornar ao cliente.',
+            %s
+        )
+        RETURNING id;
+        """,
+        (
+            dados.cliente_id,
+            vendedor["id"],
+            titulo,
+            descricao,
+            Jsonb(pendencias_validas),
+            prazo_retorno,
+        ),
+    )
+    oportunidade_id = cursor.fetchone()["id"]
+
+    cursor.execute(
+        """
+        INSERT INTO comercial.pendencias_comerciais (
+            oportunidade_id,
+            chamada_id,
+            cliente_id,
+            vendedor_id,
+            tipo,
+            prioridade,
+            status,
+            destinatario,
+            titulo,
+            descricao,
+            termo_busca,
+            estado_comercial,
+            opcoes_catalogo,
+            prazo_em
+        )
+        VALUES (
+            %s,
+            %s,
+            %s,
+            %s,
+            'revisar_itens_catalogo',
+            1,
+            'pendente',
+            'gerente_ou_humano',
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s
+        )
+        ON CONFLICT (chamada_id, tipo) DO UPDATE
+        SET
+            oportunidade_id = EXCLUDED.oportunidade_id,
+            descricao = EXCLUDED.descricao,
+            termo_busca = EXCLUDED.termo_busca,
+            estado_comercial = EXCLUDED.estado_comercial,
+            opcoes_catalogo = EXCLUDED.opcoes_catalogo,
+            prazo_em = EXCLUDED.prazo_em,
+            atualizado_em = NOW()
+        RETURNING
+            id,
+            oportunidade_id,
+            tipo,
+            prioridade,
+            status,
+            destinatario,
+            prazo_em,
+            criado_em;
+        """,
+        (
+            oportunidade_id,
+            chamada_id,
+            dados.cliente_id,
+            vendedor["id"],
+            titulo,
+            descricao,
+            " | ".join(termos)[:300],
+            Jsonb(estado),
+            Jsonb(pendencias_validas),
+            prazo_retorno,
+        ),
+    )
+    pendencia = cursor.fetchone()
+
+    cursor.execute(
+        """
+        UPDATE comercial.clientes
+        SET
+            status = CASE
+                WHEN status IN ('novo', 'teste_voz')
+                THEN 'oportunidade'
+                ELSE status
+            END,
+            proxima_acao_em = CASE
+                WHEN proxima_acao_em IS NULL
+                THEN %s
+                ELSE LEAST(proxima_acao_em, %s)
+            END,
+            atualizado_em = NOW()
+        WHERE id = %s;
+        """,
+        (
+            prazo_retorno,
+            prazo_retorno,
+            dados.cliente_id,
+        ),
+    )
+
+    cursor.execute(
+        """
+        INSERT INTO comercial.interacoes (
+            cliente_id,
+            vendedor_id,
+            canal,
+            direcao,
+            tipo,
+            resumo,
+            intencao,
+            mensagem_externa_id
+        )
+        VALUES (
+            %s,
+            %s,
+            'sistema',
+            'saida',
+            'pendencia_itens_catalogo',
+            %s,
+            'retorno_comercial',
+            %s
+        );
+        """,
+        (
+            dados.cliente_id,
+            vendedor["id"],
+            descricao,
+            f"{dados.chamada_externa_id}:pendencia-catalogo",
+        ),
+    )
+
+    cursor.execute(
+        """
+        INSERT INTO comercial.acoes_agente (
+            vendedor_id,
+            cliente_id,
+            tipo_acao,
+            origem,
+            entrada,
+            saida,
+            sucesso
+        )
+        VALUES (
+            %s,
+            %s,
+            'criar_pendencia_itens_catalogo',
+            'persistencia_chamada_voz',
+            %s,
+            %s,
+            TRUE
+        );
+        """,
+        (
+            vendedor["id"],
+            dados.cliente_id,
+            Jsonb(
+                {
+                    "chamada_id": str(chamada_id),
+                    "quantidade_itens": quantidade,
+                    "pendencias": pendencias_validas,
+                }
+            ),
+            Jsonb(
+                {
+                    "pendencia_id": str(pendencia["id"]),
+                    "oportunidade_id": str(oportunidade_id),
+                    "prazo_em": prazo_retorno.isoformat(),
+                }
+            ),
+        ),
+    )
+
+    return {
+        **pendencia,
+        "oportunidade_id": oportunidade_id,
+        "titulo": titulo,
+        "quantidade_itens": quantidade,
+        "proxima_acao": (
+            "Revisar itens pendentes e retornar ao cliente."
+        ),
+    }
+
+
+@app.post(
+    "/chamadas/registrar-conversa-voz",
+    tags=["Chamadas"],
+    status_code=http_status.HTTP_201_CREATED,
+    dependencies=[Depends(validar_api_key)],
+)
+def registrar_conversa_voz(
+    dados: ConversaVozRegistrar,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id
+                FROM comercial.chamadas_ia
+                WHERE provedor = %s
+                  AND chamada_externa_id = %s
+                ORDER BY criado_em DESC
+                LIMIT 1;
+                """,
+                (
+                    dados.provedor,
+                    dados.chamada_externa_id,
+                ),
+            )
+            chamada_existente = cursor.fetchone()
+
+            if chamada_existente is not None:
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        oportunidade_id,
+                        tipo,
+                        prioridade,
+                        status,
+                        destinatario,
+                        prazo_em,
+                        criado_em
+                    FROM comercial.pendencias_comerciais
+                    WHERE chamada_id = %s
+                    ORDER BY criado_em DESC
+                    LIMIT 1;
+                    """,
+                    (chamada_existente["id"],),
+                )
+                pendencia_existente = cursor.fetchone()
+
+                return {
+                    "criada": False,
+                    "idempotente": True,
+                    "interacoes_registradas": 0,
+                    "chamada": obter_chamada_detalhada(
+                        cursor,
+                        chamada_existente["id"],
+                    ),
+                    "venda_futura": pendencia_existente,
+                }
+
+            vendedor = obter_vendedor_por_codigo(
+                cursor,
+                dados.vendedor_codigo,
+            )
+            cliente = obter_cliente_por_id(
+                cursor,
+                dados.cliente_id,
+            )
+
+            if (
+                cliente["vendedor_id"] is not None
+                and cliente["vendedor_id"] != vendedor["id"]
+            ):
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail=(
+                        "O cliente está vinculado a outro vendedor. "
+                        "Não foi possível registrar a conversa para "
+                        f"{dados.vendedor_codigo}."
+                    ),
+                )
+
+            agenda = None
+            if dados.agenda_id is not None:
+                agenda = obter_agenda_detalhada(
+                    cursor,
+                    dados.agenda_id,
+                )
+
+                if agenda["cliente_id"] != dados.cliente_id:
+                    raise HTTPException(
+                        status_code=http_status.HTTP_409_CONFLICT,
+                        detail=(
+                            "A agenda informada pertence a outro cliente."
+                        ),
+                    )
+
+                if agenda["vendedor_id"] != vendedor["id"]:
+                    raise HTTPException(
+                        status_code=http_status.HTTP_409_CONFLICT,
+                        detail=(
+                            "A agenda informada pertence a outro vendedor."
+                        ),
+                    )
+
+            transcricao_linhas: list[str] = []
+            for turno in dados.turnos:
+                transcricao_linhas.append(
+                    f"Cliente: {turno.cliente.strip()}"
+                )
+                if turno.agente:
+                    transcricao_linhas.append(
+                        f"{vendedor['nome']}: {turno.agente.strip()}"
+                    )
+
+            transcricao_completa = "\n".join(transcricao_linhas)
+            resumo = dados.resumo or montar_resumo_conversa_voz(
+                dados.estado_comercial,
+                dados.levantamento_completo,
+                dados.resultado,
+            )
+
+            dados_extraidos = {
+                **dados.dados_extraidos,
+                "estado_comercial": dados.estado_comercial,
+                "levantamento_completo": dados.levantamento_completo,
+                "motivo_encerramento": dados.motivo_encerramento,
+                "turnos": [
+                    turno.model_dump()
+                    for turno in dados.turnos
+                ],
+                "modelos": dados.modelos,
+                "origem_integracao": "gateway_voz",
+            }
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.chamadas_ia (
+                    agenda_id,
+                    cliente_id,
+                    vendedor_id,
+                    provedor,
+                    chamada_externa_id,
+                    numero_origem,
+                    numero_destino,
+                    direcao,
+                    status,
+                    inicio_em,
+                    fim_em,
+                    duracao_segundos,
+                    atendida,
+                    transcricao,
+                    resumo,
+                    sentimento,
+                    intencao,
+                    resultado,
+                    custo_telefonia,
+                    custo_ia,
+                    custo_total,
+                    dados_extraidos
+                )
+                VALUES (
+                    %(agenda_id)s,
+                    %(cliente_id)s,
+                    %(vendedor_id)s,
+                    %(provedor)s,
+                    %(chamada_externa_id)s,
+                    %(numero_origem)s,
+                    %(numero_destino)s,
+                    %(direcao)s,
+                    'concluida',
+                    %(inicio_em)s,
+                    %(fim_em)s,
+                    %(duracao_segundos)s,
+                    TRUE,
+                    %(transcricao)s,
+                    %(resumo)s,
+                    %(sentimento)s,
+                    %(intencao)s,
+                    %(resultado)s,
+                    0,
+                    0,
+                    0,
+                    %(dados_extraidos)s
+                )
+                RETURNING id;
+                """,
+                {
+                    "agenda_id": dados.agenda_id,
+                    "cliente_id": dados.cliente_id,
+                    "vendedor_id": vendedor["id"],
+                    "provedor": dados.provedor,
+                    "chamada_externa_id": dados.chamada_externa_id,
+                    "numero_origem": dados.numero_origem,
+                    "numero_destino": dados.numero_destino,
+                    "direcao": dados.direcao,
+                    "inicio_em": dados.inicio_em,
+                    "fim_em": dados.fim_em,
+                    "duracao_segundos": dados.duracao_segundos,
+                    "transcricao": transcricao_completa or None,
+                    "resumo": resumo,
+                    "sentimento": dados.sentimento,
+                    "intencao": dados.intencao,
+                    "resultado": dados.resultado,
+                    "dados_extraidos": Jsonb(dados_extraidos),
+                },
+            )
+            chamada_id = cursor.fetchone()["id"]
+
+            interacoes_registradas = 0
+
+            for turno in dados.turnos:
+                cursor.execute(
+                    """
+                    INSERT INTO comercial.interacoes (
+                        cliente_id,
+                        vendedor_id,
+                        canal,
+                        direcao,
+                        tipo,
+                        mensagem,
+                        intencao,
+                        mensagem_externa_id
+                    )
+                    VALUES (
+                        %s,
+                        %s,
+                        'telefone',
+                        'entrada',
+                        'fala_cliente_ia',
+                        %s,
+                        %s,
+                        %s
+                    );
+                    """,
+                    (
+                        dados.cliente_id,
+                        vendedor["id"],
+                        turno.cliente,
+                        dados.intencao,
+                        (
+                            f"{dados.chamada_externa_id}:"
+                            f"cliente:{turno.numero}"
+                        ),
+                    ),
+                )
+                interacoes_registradas += 1
+
+                if turno.agente:
+                    cursor.execute(
+                        """
+                        INSERT INTO comercial.interacoes (
+                            cliente_id,
+                            vendedor_id,
+                            canal,
+                            direcao,
+                            tipo,
+                            mensagem,
+                            intencao,
+                            mensagem_externa_id
+                        )
+                        VALUES (
+                            %s,
+                            %s,
+                            'telefone',
+                            'saida',
+                            'resposta_vendedor_ia',
+                            %s,
+                            %s,
+                            %s
+                        );
+                        """,
+                        (
+                            dados.cliente_id,
+                            vendedor["id"],
+                            turno.agente,
+                            dados.intencao,
+                            (
+                                f"{dados.chamada_externa_id}:"
+                                f"agente:{turno.numero}"
+                            ),
+                        ),
+                    )
+                    interacoes_registradas += 1
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.interacoes (
+                    cliente_id,
+                    vendedor_id,
+                    canal,
+                    direcao,
+                    tipo,
+                    resumo,
+                    intencao,
+                    mensagem_externa_id
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'telefone',
+                    'saida',
+                    'resumo_chamada_ia',
+                    %s,
+                    %s,
+                    %s
+                );
+                """,
+                (
+                    dados.cliente_id,
+                    vendedor["id"],
+                    resumo,
+                    dados.intencao,
+                    f"{dados.chamada_externa_id}:resumo",
+                ),
+            )
+            interacoes_registradas += 1
+
+            snapshot_triagem = {
+                "chamada_id": str(chamada_id),
+                "chamada_externa_id": dados.chamada_externa_id,
+                "vendedor_codigo": vendedor["codigo"],
+                "resultado": dados.resultado,
+                "levantamento_completo": dados.levantamento_completo,
+                "estado_comercial": dados.estado_comercial,
+                "resumo": resumo,
+                "registrado_em": dados.fim_em.isoformat(),
+            }
+
+            cursor.execute(
+                """
+                UPDATE comercial.clientes
+                SET
+                    vendedor_id = COALESCE(vendedor_id, %s),
+                    ultima_interacao_em = %s,
+                    dados_adicionais = COALESCE(
+                        dados_adicionais,
+                        '{}'::jsonb
+                    ) || jsonb_build_object(
+                        'ultima_triagem_ia',
+                        %s
+                    ),
+                    atualizado_em = NOW()
+                WHERE id = %s;
+                """,
+                (
+                    vendedor["id"],
+                    dados.fim_em,
+                    Jsonb(snapshot_triagem),
+                    dados.cliente_id,
+                ),
+            )
+
+            if agenda is not None:
+                cursor.execute(
+                    """
+                    UPDATE comercial.agendas_comerciais
+                    SET
+                        status = 'concluida',
+                        resultado = %s,
+                        observacao = COALESCE(
+                            NULLIF(observacao, ''),
+                            %s
+                        ),
+                        atualizado_em = NOW()
+                    WHERE id = %s;
+                    """,
+                    (
+                        dados.resultado,
+                        resumo,
+                        dados.agenda_id,
+                    ),
+                )
+
+            venda_futura = criar_venda_futura_da_chamada(
+                cursor,
+                chamada_id,
+                dados,
+                vendedor,
+                resumo,
+            )
+            pendencia_catalogo = (
+                criar_pendencia_catalogo_durante_atendimento(
+                    cursor,
+                    chamada_id,
+                    dados,
+                    vendedor,
+                    resumo,
+                )
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    vendedor_id,
+                    cliente_id,
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso,
+                    duracao_ms
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'registrar_conversa_voz',
+                    'gateway_voz',
+                    %s,
+                    %s,
+                    TRUE,
+                    %s
+                );
+                """,
+                (
+                    vendedor["id"],
+                    dados.cliente_id,
+                    Jsonb(
+                        {
+                            "chamada_externa_id": (
+                                dados.chamada_externa_id
+                            ),
+                            "agenda_id": (
+                                str(dados.agenda_id)
+                                if dados.agenda_id
+                                else None
+                            ),
+                            "quantidade_turnos": len(dados.turnos),
+                        }
+                    ),
+                    Jsonb(
+                        {
+                            "chamada_id": str(chamada_id),
+                            "resultado": dados.resultado,
+                            "levantamento_completo": (
+                                dados.levantamento_completo
+                            ),
+                            "interacoes_registradas": (
+                                interacoes_registradas
+                            ),
+                            "pendencia_venda_futura_id": (
+                                str(venda_futura["id"])
+                                if venda_futura
+                                else None
+                            ),
+                            "pendencia_catalogo_id": (
+                                str(pendencia_catalogo["id"])
+                                if pendencia_catalogo
+                                else None
+                            ),
+                        }
+                    ),
+                    dados.duracao_segundos * 1000,
+                ),
+            )
+
+            chamada = obter_chamada_detalhada(
+                cursor,
+                chamada_id,
+            )
+
+        conexao.commit()
+
+    return {
+        "criada": True,
+        "idempotente": False,
+        "interacoes_registradas": interacoes_registradas,
+        "chamada": chamada,
+        "venda_futura": venda_futura,
+        "pendencia_catalogo": pendencia_catalogo,
+    }
+
+
+@app.get(
+    "/pendencias-comerciais",
+    tags=["Gestão Comercial"],
+    dependencies=[Depends(validar_api_key)],
+)
+def listar_pendencias_comerciais(
+    status_pendencia: str | None = Query(
+        default="pendente",
+        alias="status",
+    ),
+    tipo: str | None = Query(default=None),
+    vendedor_codigo: str | None = Query(default=None),
+    limite: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    if (
+        status_pendencia
+        and status_pendencia not in STATUS_PENDENCIA_COMERCIAL
+    ):
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Status de pendência inválido.",
+        )
+
+    filtros: list[str] = []
+    parametros: list[Any] = []
+
+    if status_pendencia:
+        filtros.append("p.status = %s")
+        parametros.append(status_pendencia)
+
+    if tipo:
+        filtros.append("p.tipo = %s")
+        parametros.append(tipo)
+
+    if vendedor_codigo:
+        filtros.append("v.codigo = %s")
+        parametros.append(vendedor_codigo.upper())
+
+    where_sql = (
+        "WHERE " + " AND ".join(filtros)
+        if filtros
+        else ""
+    )
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT
+                    p.id,
+                    p.oportunidade_id,
+                    p.chamada_id,
+                    p.tipo,
+                    p.prioridade,
+                    p.status,
+                    p.destinatario,
+                    p.responsavel,
+                    p.titulo,
+                    p.descricao,
+                    p.termo_busca,
+                    p.estado_comercial,
+                    p.opcoes_catalogo,
+                    p.prazo_em,
+                    p.previsao_retorno,
+                    p.resolucao,
+                    p.criado_em,
+                    p.atualizado_em,
+                    c.nome_contato,
+                    c.telefone,
+                    c.whatsapp,
+                    c.uf,
+                    v.codigo AS vendedor_codigo,
+                    v.nome_exibicao AS vendedor_nome
+                FROM comercial.pendencias_comerciais p
+                JOIN comercial.clientes c
+                    ON c.id = p.cliente_id
+                JOIN comercial.vendedores_ia v
+                    ON v.id = p.vendedor_id
+                {where_sql}
+                ORDER BY
+                    p.prioridade ASC,
+                    p.prazo_em ASC NULLS LAST,
+                    p.criado_em ASC
+                LIMIT %s;
+                """,
+                [*parametros, limite],
+            )
+            itens = cursor.fetchall()
+
+    return {
+        "quantidade": len(itens),
+        "itens": itens,
+    }
+
+
+@app.patch(
+    "/pendencias-comerciais/{pendencia_id}",
+    tags=["Gestão Comercial"],
+    dependencies=[Depends(validar_api_key)],
+)
+def atualizar_pendencia_comercial(
+    pendencia_id: UUID,
+    dados: PendenciaComercialAtualizar,
+) -> dict[str, Any]:
+    atualizacoes: list[str] = []
+    valores: list[Any] = []
+
+    if dados.status is not None:
+        atualizacoes.append("status = %s")
+        valores.append(dados.status)
+
+        if dados.status in {"resolvida", "cancelada"}:
+            atualizacoes.append("resolvido_em = NOW()")
+
+    if dados.responsavel is not None:
+        atualizacoes.append("responsavel = %s")
+        valores.append(dados.responsavel)
+
+    if dados.previsao_retorno is not None:
+        atualizacoes.append("previsao_retorno = %s")
+        valores.append(dados.previsao_retorno)
+
+    if dados.resolucao is not None:
+        atualizacoes.append("resolucao = %s")
+        valores.append(dados.resolucao)
+
+    if not atualizacoes:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Nenhuma alteração foi informada.",
+        )
+
+    atualizacoes.append("atualizado_em = NOW()")
+    valores.append(pendencia_id)
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                f"""
+                UPDATE comercial.pendencias_comerciais
+                SET {", ".join(atualizacoes)}
+                WHERE id = %s
+                RETURNING *;
+                """,
+                valores,
+            )
+            pendencia = cursor.fetchone()
+
+            if pendencia is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_404_NOT_FOUND,
+                    detail="Pendência comercial não encontrada.",
+                )
+
+        conexao.commit()
+
+    return pendencia
+
+
+@app.get(
+    "/chamadas/{chamada_id}",
+    tags=["Chamadas"],
+    dependencies=[Depends(validar_api_key)],
+)
+def buscar_chamada(
+    chamada_id: UUID,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            return obter_chamada_detalhada(cursor, chamada_id)
+
+
+@app.patch(
+    "/chamadas/{chamada_id}/finalizar",
+    tags=["Chamadas"],
+    dependencies=[Depends(validar_api_key)],
+)
+def finalizar_chamada(
+    chamada_id: UUID,
+    dados: ChamadaFinalizar,
+) -> dict[str, Any]:
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            chamada = obter_chamada_detalhada(cursor, chamada_id)
+
+            if chamada["status"] in {
+                "concluida",
+                "nao_atendida",
+                "ocupado",
+                "falha",
+                "cancelada",
+            }:
+                raise HTTPException(
+                    status_code=http_status.HTTP_409_CONFLICT,
+                    detail="Esta chamada já foi finalizada.",
+                )
+
+            fim_em = dados.fim_em or datetime.now(FUSO_PROJETO)
+            custo_total = round(dados.custo_telefonia + dados.custo_ia, 4)
+
+            cursor.execute(
+                """
+                UPDATE comercial.chamadas_ia
+                SET
+                    status = %(status)s,
+                    atendida = %(atendida)s,
+                    fim_em = %(fim_em)s,
+                    duracao_segundos = %(duracao_segundos)s,
+                    gravacao_url = %(gravacao_url)s,
+                    transcricao = %(transcricao)s,
+                    resumo = %(resumo)s,
+                    sentimento = %(sentimento)s,
+                    intencao = %(intencao)s,
+                    resultado = %(resultado)s,
+                    custo_telefonia = %(custo_telefonia)s,
+                    custo_ia = %(custo_ia)s,
+                    custo_total = %(custo_total)s,
+                    dados_extraidos = %(dados_extraidos)s
+                WHERE id = %(chamada_id)s;
+                """,
+                {
+                    "status": dados.status,
+                    "atendida": dados.atendida,
+                    "fim_em": fim_em,
+                    "duracao_segundos": dados.duracao_segundos,
+                    "gravacao_url": dados.gravacao_url,
+                    "transcricao": dados.transcricao,
+                    "resumo": dados.resumo,
+                    "sentimento": dados.sentimento,
+                    "intencao": dados.intencao,
+                    "resultado": dados.resultado,
+                    "custo_telefonia": dados.custo_telefonia,
+                    "custo_ia": dados.custo_ia,
+                    "custo_total": custo_total,
+                    "dados_extraidos": Jsonb(dados.dados_extraidos),
+                    "chamada_id": chamada_id,
+                },
+            )
+
+            cursor.execute(
+                """
+                UPDATE comercial.agendas_comerciais
+                SET
+                    status = %s,
+                    resultado = %s,
+                    proxima_tentativa_em = %s,
+                    observacao = COALESCE(%s, observacao),
+                    atualizado_em = NOW()
+                WHERE id = %s;
+                """,
+                (
+                    dados.agenda_status,
+                    dados.resultado,
+                    dados.proxima_tentativa_em,
+                    dados.observacao_agenda,
+                    chamada["agenda_id"],
+                ),
+            )
+
+            cliente_atualizacoes = [
+                "ultima_interacao_em = NOW()",
+                "atualizado_em = NOW()",
+            ]
+            cliente_valores: list[Any] = []
+
+            if dados.cliente_status is not None:
+                cliente_atualizacoes.append("status = %s")
+                cliente_valores.append(dados.cliente_status)
+
+            if dados.proxima_acao_em is not None:
+                cliente_atualizacoes.append("proxima_acao_em = %s")
+                cliente_valores.append(dados.proxima_acao_em)
+
+            cursor.execute(
+                f"""
+                UPDATE comercial.clientes
+                SET {", ".join(cliente_atualizacoes)}
+                WHERE id = %s;
+                """,
+                [*cliente_valores, chamada["cliente_id"]],
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.interacoes (
+                    cliente_id,
+                    vendedor_id,
+                    canal,
+                    direcao,
+                    tipo,
+                    mensagem,
+                    resumo,
+                    intencao,
+                    anexos
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'telefone',
+                    'saida',
+                    'chamada_ia',
+                    %s,
+                    %s,
+                    %s,
+                    %s
+                );
+                """,
+                (
+                    chamada["cliente_id"],
+                    chamada["vendedor_id"],
+                    dados.transcricao,
+                    dados.resumo,
+                    dados.intencao,
+                    Jsonb(
+                        [
+                            {
+                                "tipo": "gravacao",
+                                "url": dados.gravacao_url,
+                            }
+                        ]
+                        if dados.gravacao_url
+                        else []
+                    ),
+                ),
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    vendedor_id,
+                    cliente_id,
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso,
+                    custo
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'finalizar_chamada',
+                    'api_comercial',
+                    %s,
+                    %s,
+                    TRUE,
+                    %s
+                );
+                """,
+                (
+                    chamada["vendedor_id"],
+                    chamada["cliente_id"],
+                    Jsonb(
+                        {
+                            "chamada_id": str(chamada_id),
+                            "agenda_status": dados.agenda_status,
+                        }
+                    ),
+                    Jsonb(
+                        {
+                            "status": dados.status,
+                            "atendida": dados.atendida,
+                            "resultado": dados.resultado,
+                        }
+                    ),
+                    custo_total,
+                ),
+            )
+
+            chamada_finalizada = obter_chamada_detalhada(cursor, chamada_id)
+
+        conexao.commit()
+        return chamada_finalizada
+
+
+@app.post(
+    "/telefonia/twilio/teste",
+    tags=["Telefonia Twilio"],
+    status_code=http_status.HTTP_201_CREATED,
+    dependencies=[Depends(validar_api_key)],
+)
+def iniciar_teste_twilio(
+    dados: TwilioTesteChamada,
+) -> dict[str, Any]:
+    template_trial = (
+        "https://webhooks.twilio.com/v1/Voice/Template/"
+        "voice_text_to_speech"
+    )
+    callback_url = f"{TWILIO_BASE_URL}/webhooks/twilio/status-chamada"
+    telefone_mascarado = mascarar_telefone(dados.numero_destino)
+
+    try:
+        chamada = obter_cliente_twilio().calls.create(
+            to=dados.numero_destino,
+            from_=TWILIO_PHONE_NUMBER,
+            url=template_trial,
+            method="POST",
+            status_callback=callback_url,
+            status_callback_event=[
+                "initiated",
+                "ringing",
+                "answered",
+                "completed",
+            ],
+            status_callback_method="POST",
+            timeout=dados.timeout_segundos,
+        )
+    except TwilioRestException as erro:
+        with obter_conexao() as conexao:
+            with conexao.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO comercial.acoes_agente (
+                        tipo_acao,
+                        origem,
+                        entrada,
+                        saida,
+                        sucesso,
+                        erro
+                    )
+                    VALUES (
+                        'twilio_teste_chamada',
+                        'api_comercial',
+                        %s,
+                        %s,
+                        FALSE,
+                        %s
+                    );
+                    """,
+                    (
+                        Jsonb(
+                            {
+                                "numero_destino": telefone_mascarado,
+                                "timeout_segundos": dados.timeout_segundos,
+                                "template": "voice_text_to_speech",
+                            }
+                        ),
+                        Jsonb(
+                            {
+                                "codigo_twilio": erro.code,
+                                "status_http": erro.status,
+                            }
+                        ),
+                        str(erro),
+                    ),
+                )
+            conexao.commit()
+
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "mensagem": "A Twilio recusou a criação da chamada.",
+                "codigo_twilio": erro.code,
+                "status_http": erro.status,
+                "detalhe_twilio": erro.msg,
+            },
+        ) from erro
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso
+                )
+                VALUES (
+                    'twilio_teste_chamada',
+                    'api_comercial',
+                    %s,
+                    %s,
+                    TRUE
+                );
+                """,
+                (
+                    Jsonb(
+                        {
+                            "numero_destino": telefone_mascarado,
+                            "timeout_segundos": dados.timeout_segundos,
+                            "template": "voice_text_to_speech",
+                        }
+                    ),
+                    Jsonb(
+                        {
+                            "call_sid": chamada.sid,
+                            "status": chamada.status,
+                            "numero_origem": TWILIO_PHONE_NUMBER,
+                        }
+                    ),
+                ),
+            )
+        conexao.commit()
+
+    return {
+        "mensagem": "Chamada de teste solicitada à Twilio.",
+        "call_sid": chamada.sid,
+        "status": chamada.status,
+        "numero_origem": TWILIO_PHONE_NUMBER,
+        "numero_destino": telefone_mascarado,
+        "template_trial": "voice_text_to_speech",
+        "status_callback": callback_url,
+    }
+
+
+@app.get(
+    "/telefonia/twilio/chamadas/{call_sid}",
+    tags=["Telefonia Twilio"],
+    dependencies=[Depends(validar_api_key)],
+)
+def consultar_chamada_twilio(
+    call_sid: str,
+) -> dict[str, Any]:
+    if not re.fullmatch(r"CA[0-9a-fA-F]{32}", call_sid):
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Call SID da Twilio inválido.",
+        )
+
+    try:
+        chamada = obter_cliente_twilio().calls(call_sid).fetch()
+    except TwilioRestException as erro:
+        codigo_http = (
+            http_status.HTTP_404_NOT_FOUND
+            if erro.status == 404
+            else http_status.HTTP_502_BAD_GATEWAY
+        )
+        raise HTTPException(
+            status_code=codigo_http,
+            detail={
+                "mensagem": "Não foi possível consultar a chamada na Twilio.",
+                "codigo_twilio": erro.code,
+                "status_http": erro.status,
+                "detalhe_twilio": erro.msg,
+            },
+        ) from erro
+
+    return {
+        "call_sid": chamada.sid,
+        "status": chamada.status,
+        "direcao": chamada.direction,
+        "numero_origem": chamada.from_,
+        "numero_destino": mascarar_telefone(chamada.to),
+        "duracao_segundos": chamada.duration,
+        "preco": chamada.price,
+        "moeda": chamada.price_unit,
+        "inicio_em": chamada.start_time,
+        "fim_em": chamada.end_time,
+    }
+
+
+@app.post(
+    "/webhooks/twilio/status-chamada",
+    include_in_schema=False,
+)
+async def receber_status_chamada_twilio(
+    request: Request,
+) -> dict[str, str]:
+    dados = await validar_webhook_twilio(request)
+
+    call_sid = dados.get("CallSid")
+    status_twilio = dados.get("CallStatus", "")
+    status_interno = STATUS_TWILIO_PARA_INTERNO.get(status_twilio)
+    duracao = dados.get("CallDuration")
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso
+                )
+                VALUES (
+                    'twilio_status_chamada',
+                    'twilio_webhook',
+                    %s,
+                    %s,
+                    TRUE
+                );
+                """,
+                (
+                    Jsonb(dados),
+                    Jsonb(
+                        {
+                            "call_sid": call_sid,
+                            "status_twilio": status_twilio,
+                            "status_interno": status_interno,
+                        }
+                    ),
+                ),
+            )
+
+            if call_sid and status_interno:
+                cursor.execute(
+                    """
+                    UPDATE comercial.chamadas_ia
+                    SET
+                        status = %s,
+                        duracao_segundos = COALESCE(%s, duracao_segundos),
+                        atendida = CASE
+                            WHEN %s IN ('em_andamento', 'concluida') THEN TRUE
+                            ELSE atendida
+                        END,
+                        fim_em = CASE
+                            WHEN %s IN (
+                                'concluida',
+                                'nao_atendida',
+                                'ocupado',
+                                'falha',
+                                'cancelada'
+                            )
+                            THEN COALESCE(fim_em, NOW())
+                            ELSE fim_em
+                        END
+                    WHERE chamada_externa_id = %s;
+                    """,
+                    (
+                        status_interno,
+                        int(duracao) if duracao and duracao.isdigit() else None,
+                        status_interno,
+                        status_interno,
+                        call_sid,
+                    ),
+                )
+
+        conexao.commit()
+
+    return {"status": "recebido"}
+
+
+@app.post(
+    "/telefonia/twilio/teste-interativo",
+    tags=["Telefonia Twilio"],
+    status_code=http_status.HTTP_201_CREATED,
+    dependencies=[Depends(validar_api_key)],
+)
+def iniciar_teste_interativo_twilio(
+    dados: TwilioTesteInterativo,
+) -> dict[str, Any]:
+    url_voz = f"{TWILIO_BASE_URL}/webhooks/twilio/voz-interativa"
+    callback_url = f"{TWILIO_BASE_URL}/webhooks/twilio/status-chamada"
+    telefone_mascarado = mascarar_telefone(dados.numero_destino)
+
+    try:
+        chamada = obter_cliente_twilio().calls.create(
+            to=dados.numero_destino,
+            from_=TWILIO_PHONE_NUMBER,
+            url=url_voz,
+            method="POST",
+            status_callback=callback_url,
+            status_callback_event=[
+                "initiated",
+                "ringing",
+                "answered",
+                "completed",
+            ],
+            status_callback_method="POST",
+            timeout=dados.timeout_segundos,
+        )
+    except TwilioRestException as erro:
+        with obter_conexao() as conexao:
+            with conexao.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO comercial.acoes_agente (
+                        tipo_acao,
+                        origem,
+                        entrada,
+                        saida,
+                        sucesso,
+                        erro
+                    )
+                    VALUES (
+                        'twilio_teste_interativo',
+                        'api_comercial',
+                        %s,
+                        %s,
+                        FALSE,
+                        %s
+                    );
+                    """,
+                    (
+                        Jsonb(
+                            {
+                                "numero_destino": telefone_mascarado,
+                                "timeout_segundos": dados.timeout_segundos,
+                            }
+                        ),
+                        Jsonb(
+                            {
+                                "codigo_twilio": erro.code,
+                                "status_http": erro.status,
+                            }
+                        ),
+                        str(erro),
+                    ),
+                )
+            conexao.commit()
+
+        raise HTTPException(
+            status_code=http_status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "mensagem": "A Twilio recusou o teste interativo.",
+                "codigo_twilio": erro.code,
+                "status_http": erro.status,
+                "detalhe_twilio": erro.msg,
+            },
+        ) from erro
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso
+                )
+                VALUES (
+                    'twilio_teste_interativo',
+                    'api_comercial',
+                    %s,
+                    %s,
+                    TRUE
+                );
+                """,
+                (
+                    Jsonb(
+                        {
+                            "numero_destino": telefone_mascarado,
+                            "timeout_segundos": dados.timeout_segundos,
+                        }
+                    ),
+                    Jsonb(
+                        {
+                            "call_sid": chamada.sid,
+                            "status": chamada.status,
+                            "url_voz": url_voz,
+                        }
+                    ),
+                ),
+            )
+        conexao.commit()
+
+    return {
+        "mensagem": "Teste interativo solicitado à Twilio.",
+        "call_sid": chamada.sid,
+        "status": chamada.status,
+        "numero_origem": TWILIO_PHONE_NUMBER,
+        "numero_destino": telefone_mascarado,
+        "url_voz": url_voz,
+        "status_callback": callback_url,
+    }
+
+
+@app.post(
+    "/webhooks/twilio/voz-interativa",
+    include_in_schema=False,
+)
+async def fornecer_voz_interativa_twilio(
+    request: Request,
+):
+    await validar_webhook_twilio(request)
+
+    resposta = VoiceResponse()
+    coleta = resposta.gather(
+        input="speech",
+        action=f"{TWILIO_BASE_URL}/webhooks/twilio/resposta-interativa",
+        method="POST",
+        language="pt-BR",
+        speech_timeout="auto",
+        timeout=5,
+        action_on_empty_result=True,
+    )
+    coleta.say(
+        (
+            "Olá. Aqui é o Carlos, assistente virtual da RBK Distribuidora. "
+            "Esta é uma ligação de teste. "
+            "Depois do sinal, diga seu nome e uma peça que gostaria de consultar."
+        ),
+        language="pt-BR",
+    )
+    resposta.say(
+        "Não consegui receber sua resposta. O teste será encerrado.",
+        language="pt-BR",
+    )
+    resposta.hangup()
+
+    return Response(
+        content=str(resposta),
+        media_type="application/xml",
+    )
+
+
+@app.post(
+    "/webhooks/twilio/resposta-interativa",
+    include_in_schema=False,
+)
+async def receber_resposta_interativa_twilio(
+    request: Request,
+):
+    dados = await validar_webhook_twilio(request)
+
+    call_sid = dados.get("CallSid")
+    fala = (dados.get("SpeechResult") or "").strip()
+    confianca = dados.get("Confidence")
+
+    if len(fala) > 500:
+        fala = fala[:500]
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO comercial.acoes_agente (
+                    tipo_acao,
+                    origem,
+                    entrada,
+                    saida,
+                    sucesso
+                )
+                VALUES (
+                    'twilio_resposta_interativa',
+                    'twilio_webhook',
+                    %s,
+                    %s,
+                    TRUE
+                );
+                """,
+                (
+                    Jsonb(
+                        {
+                            "CallSid": call_sid,
+                            "SpeechResult": fala,
+                            "Confidence": confianca,
+                        }
+                    ),
+                    Jsonb(
+                        {
+                            "fala_recebida": bool(fala),
+                            "tamanho": len(fala),
+                        }
+                    ),
+                ),
+            )
+        conexao.commit()
+
+    resposta = VoiceResponse()
+
+    if fala:
+        resposta.say(
+            (
+                "Entendi sua resposta. "
+                "O reconhecimento de voz do projeto foi validado com sucesso. "
+                "Obrigado."
+            ),
+            language="pt-BR",
+        )
+    else:
+        resposta.say(
+            (
+                "Não consegui entender sua resposta. "
+                "O teste de telefonia foi concluído, mas o reconhecimento "
+                "de voz precisa ser repetido."
+            ),
+            language="pt-BR",
+        )
+
+    resposta.hangup()
+
+    return Response(
+        content=str(resposta),
+        media_type="application/xml",
+    )
+
+
+@app.get(
+    "/telefonia/twilio/teste-interativo/{call_sid}",
+    tags=["Telefonia Twilio"],
+    dependencies=[Depends(validar_api_key)],
+)
+def consultar_teste_interativo_twilio(
+    call_sid: str,
+) -> dict[str, Any]:
+    if not re.fullmatch(r"CA[0-9a-fA-F]{32}", call_sid):
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Call SID da Twilio inválido.",
+        )
+
+    with obter_conexao() as conexao:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    entrada,
+                    saida,
+                    criado_em
+                FROM comercial.acoes_agente
+                WHERE tipo_acao = 'twilio_resposta_interativa'
+                  AND entrada ->> 'CallSid' = %s
+                ORDER BY criado_em DESC
+                LIMIT 1;
+                """,
+                (call_sid,),
+            )
+            resultado = cursor.fetchone()
+
+    if resultado is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="Ainda não existe resposta reconhecida para esta chamada.",
+        )
+
+    return {
+        "call_sid": call_sid,
+        "fala_reconhecida": resultado["entrada"].get("SpeechResult"),
+        "confianca": resultado["entrada"].get("Confidence"),
+        "fala_recebida": resultado["saida"].get("fala_recebida"),
+        "registrado_em": resultado["criado_em"],
+    }
+
